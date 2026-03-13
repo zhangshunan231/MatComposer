@@ -332,6 +332,11 @@ class MatComposerProperties(bpy.types.PropertyGroup):
     lock_base_slot: bpy.props.BoolProperty(name="Lock Base", default=False)
     lock_overlay_slot: bpy.props.BoolProperty(name="Lock Overlay", default=False)
     lock_detail_slot: bpy.props.BoolProperty(name="Lock Detail", default=False)
+    force_external_mapping: bpy.props.BoolProperty(
+        name="Force External UV Mapping",
+        description="Override slot materials to use the assembled material's UV/Mapping chain",
+        default=False
+    )
 
     apply_slot_role: bpy.props.EnumProperty(
         name="Apply To Slot",

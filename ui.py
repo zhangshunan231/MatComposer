@@ -336,6 +336,8 @@ class MATCOMPOSER_PT_Exploration(bpy.types.Panel):
         row = layout.row()
         row.enabled = semantic_ready and library_ready and (not props.is_generating)
         row.operator("matcomposer.assemble_slots", icon='NODE_MATERIAL')
+        row = layout.row()
+        row.prop(props, "force_external_mapping", text="Force External UV Mapping")
         
         # 1. Local Exploration (Variants)
         layout.label(text="Local Exploration:")

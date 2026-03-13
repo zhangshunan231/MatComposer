@@ -463,8 +463,26 @@ def _material_to_node_group(source_material: bpy.types.Material, group_name: str
 
     group_in = ng.nodes.new(type="NodeGroupInput")
     group_out = ng.nodes.new(type="NodeGroupOutput")
-    group_in.location = (-1400, 0)
-    group_out.location = (800, 0)
+    # Position IO near the existing node bbox to avoid long stretched wires
+    xs = []
+    ys = []
+    for n in ng.nodes:
+        if n in (group_in, group_out):
+            continue
+        try:
+            xs.append(float(n.location.x))
+            ys.append(float(n.location.y))
+        except Exception:
+            continue
+    if xs and ys:
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        center_y = (min_y + max_y) * 0.5
+        group_in.location = (min_x - 200.0, center_y)
+        group_out.location = (max_x + 200.0, center_y)
+    else:
+        group_in.location = (-600, 0)
+        group_out.location = (400, 0)
 
     _ensure_tree_socket(ng, "INPUT", "NodeSocketVector", "Vector")
 
@@ -594,13 +612,15 @@ def inject_node_group_into_material(
     slot_role: str = "Base",
     relation: str = "base",
     mask_hints=None,
+    use_external_mapping: bool = True,
 ):
     if not material or not material.use_nodes or not material.node_tree:
         return False
 
     tree = material.node_tree
     _principled, _out = ensure_master_shader(tree)
-    mapping = _ensure_mapping_chain(tree)
+
+    mapping = _ensure_mapping_chain(tree) if use_external_mapping or relation == "overlay" else None
 
     group_node = tree.nodes.new(type="ShaderNodeGroup")
     group_node.node_tree = node_group
@@ -608,11 +628,12 @@ def inject_node_group_into_material(
     group_node.name = f"MC_{slot_role}_{node_group.name}"
     group_node.location = (-350, 0 if slot_role == "Base" else -220)
 
-    for inp_name in ("Vector", "UV", "Mapping"):
-        inp = group_node.inputs.get(inp_name)
-        if inp and not inp.is_linked:
-            tree.links.new(mapping.outputs.get("Vector"), inp)
-            break
+    if use_external_mapping and mapping:
+        for inp_name in ("Vector", "UV", "Mapping"):
+            inp = group_node.inputs.get(inp_name)
+            if inp and not inp.is_linked:
+                tree.links.new(mapping.outputs.get("Vector"), inp)
+                break
 
     fac = None
     if relation == "overlay":
@@ -675,7 +696,7 @@ def inject_node_group_into_material(
 
 
 def apply_library_entry_to_object_material(
-    context, entry: dict, slot_role: str = "Base", relation: str = "base", slot_spec: dict = None
+    context, entry: dict, slot_role: str = "Base", relation: str = "base", slot_spec: dict = None, use_external_mapping: bool = True
 ):
     obj = getattr(context, "active_object", None)
     if not obj or obj.type != "MESH":
@@ -749,4 +770,11 @@ def apply_library_entry_to_object_material(
         if isinstance(etags, (list, tuple)):
             mask_hints.extend([str(t) for t in etags if str(t).strip()])
 
-    return inject_node_group_into_material(mat, ng, slot_role=slot_role, relation=relation, mask_hints=mask_hints)
+    return inject_node_group_into_material(
+        mat,
+        ng,
+        slot_role=slot_role,
+        relation=relation,
+        mask_hints=mask_hints,
+        use_external_mapping=use_external_mapping,
+    )

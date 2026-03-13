@@ -831,6 +831,7 @@ class MATCOMPOSER_OT_AssembleSlots(bpy.types.Operator):
                 slot_role=role,
                 relation=relation,
                 slot_spec=slot,
+                use_external_mapping=bool(getattr(props, "force_external_mapping", False)),
             )
             applied = applied or bool(ok)
 
