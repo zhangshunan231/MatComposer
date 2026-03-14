@@ -1,5 +1,6 @@
 import bpy
 import os
+import json
 
 
 HOOK_OUTPUT_TO_PRINCIPLED_INPUT = {
@@ -12,6 +13,7 @@ HOOK_OUTPUT_TO_PRINCIPLED_INPUT = {
 }
 
 _MASK_BLENDS_CACHE = None
+_MASK_LLM_CACHE = {}
 
 
 def _repo_root_dir():
@@ -71,7 +73,92 @@ def _append_first_node_group(full_path: str, prefer_name: str = ""):
         return None
 
 
-def _pick_mask_key(hints, available_keys):
+def _pick_mask_key_with_llm(hints, available_keys, context=None):
+    if not available_keys:
+        return ""
+    scene = getattr(context, "scene", None) if context else None
+    if scene is None:
+        scene = getattr(bpy.context, "scene", None)
+    props = getattr(scene, "mat_composer", None) if scene else None
+    api_key = str(getattr(props, "api_key", "") or "").strip() if props else ""
+    model = str(getattr(props, "model_selection", "") or "").strip() if props else ""
+    if not api_key:
+        return ""
+    if not model:
+        model = "qwen-plus"
+
+    tokens = []
+    for h in hints or []:
+        if h is None:
+            continue
+        if isinstance(h, (list, tuple, set)):
+            for x in h:
+                s = str(x or "").strip()
+                if s:
+                    tokens.append(s)
+        else:
+            s = str(h or "").strip()
+            if s:
+                tokens.append(s)
+    if not tokens:
+        return ""
+
+    cache_key = (
+        "|".join(sorted([str(x).lower() for x in tokens])),
+        "|".join(sorted([str(x) for x in available_keys])),
+    )
+    cached = _MASK_LLM_CACHE.get(cache_key)
+    if cached in available_keys:
+        return cached
+
+    try:
+        try:
+            from ..llm_handler import LLMClient
+        except Exception:
+            from llm_handler import LLMClient
+    except Exception:
+        return ""
+
+    client = LLMClient(api_key, model=model)
+    sys_prompt = (
+        "You select one mask key for Blender material overlay.\n"
+        "Return ONLY strict JSON: {\"mask\": \"one_of_available\"}.\n"
+        "No markdown. No extra keys."
+    )
+    user_prompt = (
+        "Available mask keys:\n"
+        + json.dumps(sorted(list(available_keys)), ensure_ascii=False)
+        + "\nHints:\n"
+        + json.dumps(tokens, ensure_ascii=False)
+        + "\nSelect the single best mask."
+    )
+    data = {
+        "model": model,
+        "messages": client._build_messages(sys_prompt, user_prompt),
+        "temperature": 0.0,
+    }
+    content, _result = client._send_request(data, debug=False, debug_label="Mask Select")
+    if not content:
+        return ""
+    raw = str(content).strip()
+    if raw.startswith("```json"):
+        raw = raw[7:]
+    elif raw.startswith("```"):
+        raw = raw[3:]
+    if raw.endswith("```"):
+        raw = raw[:-3]
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return ""
+    picked = str(parsed.get("mask") or "").strip()
+    if picked in available_keys:
+        _MASK_LLM_CACHE[cache_key] = picked
+        return picked
+    return ""
+
+
+def _pick_mask_key(hints, available_keys, context=None):
     if not available_keys:
         return ""
     toks = []
@@ -101,10 +188,9 @@ def _pick_mask_key(hints, available_keys):
         "edge_mask": {"edge", "wear", "scratch", "scratched", "rust", "rusty", "chip", "chipped", "curvature"},
         "peeling_mask": {"peel", "peeling", "paint", "coating", "flake", "flaking", "chip", "chipped"},
         "splatter_mask": {"splatter", "spray", "splash", "droplet", "drops", "mud", "muddy"},
-        "proximity_mask": {"dirt", "dust", "grime", "moss", "snow", "wet", "water", "stain", "stained"},
         "cell_mask": {"cell", "voronoi", "organic", "pattern"},
         "normal_mask": {"normal"},
-        "ao_mask": {"ao", "ambient", "occlusion", "cavity"},
+        "ao_mask": {"ao", "ambient", "occlusion", "cavity", "dirt", "dust", "grime", "moss", "snow", "wet", "water", "stain", "stained"},
         "generated_mask": {"generated", "random", "noise"},
     }
 
@@ -123,6 +209,10 @@ def _pick_mask_key(hints, available_keys):
                         scores[k] += 1
 
     best = max(scores.items(), key=lambda kv: (kv[1], kv[0])) if scores else ("", 0)
+    if best[1] <= 0 or best[0] == "ao_mask":
+        llm_pick = _pick_mask_key_with_llm(toks, available_keys, context=context)
+        if llm_pick:
+            return llm_pick
     if best[1] <= 0:
         if "ao_mask" in available_keys:
             return "ao_mask"
@@ -130,9 +220,9 @@ def _pick_mask_key(hints, available_keys):
     return best[0]
 
 
-def _mask_fac_socket(tree, mapping, mask_hints, location=(-350, -520)):
+def _mask_fac_socket(tree, mapping, mask_hints, location=(-350, -520), context=None):
     blends = _list_mask_blends()
-    key = _pick_mask_key(mask_hints, set(blends.keys()))
+    key = _pick_mask_key(mask_hints, set(blends.keys()), context=context)
     if not key:
         return None
     full_path = blends.get(key)
@@ -149,14 +239,35 @@ def _mask_fac_socket(tree, mapping, mask_hints, location=(-350, -520)):
     group_node.location = location
 
     if mapping:
+        linked = False
         for inp_name in ("Vector", "UV", "Mapping"):
             inp = group_node.inputs.get(inp_name)
             if inp and not inp.is_linked:
                 try:
                     tree.links.new(mapping.outputs.get("Vector"), inp)
+                    linked = True
                 except Exception:
                     pass
                 break
+        if not linked:
+            try:
+                inputs = list(getattr(group_node, "inputs", []) or [])
+            except Exception:
+                inputs = []
+            for inp in inputs:
+                if not inp or getattr(inp, "is_linked", False):
+                    continue
+                try:
+                    stype = str(getattr(inp, "type", "") or "")
+                except Exception:
+                    stype = ""
+                if stype == "VECTOR":
+                    try:
+                        tree.links.new(mapping.outputs.get("Vector"), inp)
+                        linked = True
+                        break
+                    except Exception:
+                        pass
 
     out_priority = ("Fac", "Factor", "Mask", "Value", "Result", "Alpha", "Color")
     picked = None
@@ -284,8 +395,10 @@ def _get_or_create_principled(tree):
     return n
 
 
-def ensure_master_shader(tree):
+def ensure_master_shader(tree, create_principled: bool = True):
     out = _get_or_create_output(tree)
+    if not create_principled:
+        return None, out
     bsdf = _get_or_create_principled(tree)
     surface = out.inputs.get("Surface")
     bsdf_out = bsdf.outputs.get("BSDF")
@@ -399,8 +512,39 @@ def _material_to_node_group(source_material: bpy.types.Material, group_name: str
 
     ng = bpy.data.node_groups.new(name=name, type='ShaderNodeTree')
 
+    def _node_xy(node):
+        try:
+            return float(node.location.x), float(node.location.y)
+        except Exception:
+            try:
+                return float(node.location[0]), float(node.location[1])
+            except Exception:
+                return 0.0, 0.0
+
+    def _abs_location_src(node):
+        x, y = _node_xy(node)
+        parent = getattr(node, "parent", None)
+        while parent:
+            px, py = _node_xy(parent)
+            x += px
+            y += py
+            parent = getattr(parent, "parent", None)
+        return x, y
+
     node_map = {}
+    output_nodes = []
     for n in src_tree.nodes:
+        try:
+            if getattr(n, "type", "") == "OUTPUT_MATERIAL":
+                output_nodes.append(n)
+                continue
+        except Exception:
+            pass
+        try:
+            if getattr(n, "type", "") == "FRAME":
+                continue
+        except Exception:
+            pass
         try:
             nn = ng.nodes.new(type=n.bl_idname)
         except Exception:
@@ -408,14 +552,22 @@ def _material_to_node_group(source_material: bpy.types.Material, group_name: str
         nn.name = n.name
         nn.label = n.label
         try:
-            nn.location = n.location.copy()
+            if hasattr(n, "node_tree") and hasattr(nn, "node_tree"):
+                if getattr(n, "node_tree", None):
+                    nn.node_tree = n.node_tree
         except Exception:
-            try:
-                nn.location = (float(n.location[0]), float(n.location[1]))
-            except Exception:
-                pass
+            pass
+        try:
+            ax, ay = _abs_location_src(n)
+            nn.location = (ax, ay)
+        except Exception:
+            pass
         try:
             nn.width = n.width
+        except Exception:
+            pass
+        try:
+            nn.height = n.height
         except Exception:
             pass
         try:
@@ -447,31 +599,18 @@ def _material_to_node_group(source_material: bpy.types.Material, group_name: str
             except Exception:
                 pass
 
-    for l in src_tree.links:
-        fn = node_map.get(l.from_node)
-        tn = node_map.get(l.to_node)
-        if not fn or not tn:
-            continue
-        fs = fn.outputs.get(l.from_socket.name) if fn.outputs else None
-        ts = tn.inputs.get(l.to_socket.name) if tn.inputs else None
-        if not fs or not ts:
-            continue
-        try:
-            ng.links.new(fs, ts)
-        except Exception:
-            pass
-
     group_in = ng.nodes.new(type="NodeGroupInput")
     group_out = ng.nodes.new(type="NodeGroupOutput")
-    # Position IO near the existing node bbox to avoid long stretched wires
+    
     xs = []
     ys = []
     for n in ng.nodes:
         if n in (group_in, group_out):
             continue
         try:
-            xs.append(float(n.location.x))
-            ys.append(float(n.location.y))
+            ax, ay = _node_xy(n)
+            xs.append(float(ax))
+            ys.append(float(ay))
         except Exception:
             continue
     if xs and ys:
@@ -500,11 +639,61 @@ def _material_to_node_group(source_material: bpy.types.Material, group_name: str
                         pass
                     break
 
-    output_node = None
-    for n in src_tree.nodes:
-        if getattr(n, "type", "") == "OUTPUT_MATERIAL":
-            output_node = n
-            break
+    def _socket_type_for_socket(sock):
+        if not sock:
+            return "NodeSocketFloat"
+        try:
+            st = str(getattr(sock, "type", "") or "")
+        except Exception:
+            st = ""
+        if st == "SHADER":
+            return "NodeSocketShader"
+        if st in ("RGBA", "COLOR"):
+            return "NodeSocketColor"
+        if st == "VECTOR":
+            return "NodeSocketVector"
+        if st in ("VALUE", "FLOAT"):
+            return "NodeSocketFloat"
+        return "NodeSocketFloat"
+
+    for l in src_tree.links:
+        fn = node_map.get(l.from_node)
+        if not fn:
+            continue
+        fs = fn.outputs.get(l.from_socket.name) if fn.outputs else None
+        if not fs:
+            continue
+        if l.to_node in output_nodes:
+            out_name = str(l.to_socket.name or "")
+            if out_name:
+                if out_name == "Surface":
+                    if _ensure_tree_socket(ng, "OUTPUT", "NodeSocketShader", "Hook_BSDF"):
+                        hook_bsdf = group_out.inputs.get("Hook_BSDF")
+                        if hook_bsdf:
+                            try:
+                                ng.links.new(fs, hook_bsdf)
+                            except Exception:
+                                pass
+                if _ensure_tree_socket(ng, "OUTPUT", _socket_type_for_socket(fs), out_name):
+                    dst = group_out.inputs.get(out_name)
+                    if dst:
+                        try:
+                            ng.links.new(fs, dst)
+                        except Exception:
+                            pass
+            continue
+        tn = node_map.get(l.to_node)
+        if not tn:
+            continue
+        ts = tn.inputs.get(l.to_socket.name) if tn.inputs else None
+        if not ts:
+            continue
+        try:
+            ng.links.new(fs, ts)
+        except Exception:
+            pass
+
+    output_node = output_nodes[0] if output_nodes else None
 
     principled = None
     if output_node:
@@ -613,12 +802,13 @@ def inject_node_group_into_material(
     relation: str = "base",
     mask_hints=None,
     use_external_mapping: bool = True,
+    context=None,
 ):
     if not material or not material.use_nodes or not material.node_tree:
         return False
 
     tree = material.node_tree
-    _principled, _out = ensure_master_shader(tree)
+    out_node = _get_or_create_output(tree)
 
     mapping = _ensure_mapping_chain(tree) if use_external_mapping or relation == "overlay" else None
 
@@ -637,13 +827,12 @@ def inject_node_group_into_material(
 
     fac = None
     if relation == "overlay":
-        fac = _mask_fac_socket(tree, mapping, mask_hints, location=(-350, -520))
+        fac = _mask_fac_socket(tree, mapping, mask_hints, location=(-350, -520), context=context)
         if not fac:
             fac = _create_ao_mask(tree, location=(-350, -520))
 
     bsdf_out = group_node.outputs.get("Hook_BSDF")
     if bsdf_out:
-        out_node = _get_or_create_output(tree)
         surface = out_node.inputs.get("Surface") if out_node else None
         if surface:
             if relation == "overlay" and surface.is_linked:
@@ -670,6 +859,7 @@ def inject_node_group_into_material(
                 tree.links.new(bsdf_out, surface)
         return True
 
+    _principled, _out = ensure_master_shader(tree, create_principled=True)
     for hook_out, principled_in in HOOK_OUTPUT_TO_PRINCIPLED_INPUT.items():
         out_socket = group_node.outputs.get(hook_out)
         if not out_socket:
@@ -777,4 +967,5 @@ def apply_library_entry_to_object_material(
         relation=relation,
         mask_hints=mask_hints,
         use_external_mapping=use_external_mapping,
+        context=context,
     )
