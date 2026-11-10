@@ -1,6 +1,187 @@
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (C) 2026 MatComposer authors
+
 import bpy
 import json
+import os
 from .utils import library_manager
+
+_MASK_UI_IMAGE_CACHE = {}
+_MASK_UI_DEBUG = {}
+
+
+def _repo_root_dir():
+    try:
+        return os.path.abspath(os.path.join(os.path.dirname(__file__)))
+    except Exception:
+        return os.path.abspath(os.getcwd())
+
+
+def _masks_dir():
+    return os.path.join(_repo_root_dir(), "masks")
+
+
+def _mask_preview_path(mask_key):
+    root = _masks_dir()
+    for ext in (".jpg", ".png", ".jpeg", ".webp"):
+        path = os.path.join(root, f"{mask_key}{ext}")
+        if os.path.exists(path):
+            return path
+    return ""
+
+
+def _mask_keys():
+    out = []
+    root = _masks_dir()
+    try:
+        for fn in os.listdir(root):
+            if not str(fn).lower().endswith(".blend"):
+                continue
+            key = os.path.splitext(str(fn))[0].strip()
+            if key and key not in out:
+                out.append(key)
+    except Exception:
+        return []
+    out.sort()
+    return out
+
+
+def _mask_items_for_ui():
+    items = [{"key": "", "label": "No Mask", "icon_id": 0}]
+    for key in _mask_keys():
+        items.append({"key": key, "label": key, "icon_id": _load_mask_preview_icon(key)})
+    return items
+
+
+def _mask_image_cache_key(mask_key):
+    return f"_mc_mask_preview__{mask_key}"
+
+
+def _load_mask_preview_icon(mask_key):
+    key = str(mask_key or "").strip()
+    if not key:
+        return 0
+    dbg = {"path": "", "image_icon_id": 0, "error": ""}
+    path = _mask_preview_path(key)
+    dbg["path"] = path
+    if not path:
+        dbg["error"] = "preview file not found"
+        _MASK_UI_DEBUG[key] = dbg
+        return 0
+
+    img = _MASK_UI_IMAGE_CACHE.get(key)
+    img_name = str(getattr(img, "name", "") or "")
+    if img and img_name and bpy.data.images.get(img_name) is not None:
+        try:
+            img.preview_ensure()
+            prev = img.preview
+            icon_id = int(getattr(prev, "icon_id", 0) or 0) if prev else 0
+            dbg["image_icon_id"] = icon_id
+            if icon_id > 0:
+                _MASK_UI_DEBUG[key] = dbg
+                return icon_id
+        except Exception as e:
+            dbg["error"] = f"image-cache: {e}"
+
+    try:
+        img = bpy.data.images.load(path, check_existing=True)
+    except Exception as e:
+        dbg["error"] = f"image-load: {e}"
+        _MASK_UI_DEBUG[key] = dbg
+        return 0
+
+    try:
+        img.name = _mask_image_cache_key(key)
+    except Exception:
+        pass
+
+    try:
+        img.preview_ensure()
+        prev = img.preview
+        icon_id = int(getattr(prev, "icon_id", 0) or 0) if prev else 0
+        dbg["image_icon_id"] = icon_id
+    except Exception as e:
+        dbg["error"] = f"image-preview: {e}"
+        icon_id = 0
+    _MASK_UI_IMAGE_CACHE[key] = img
+    _MASK_UI_DEBUG[key] = dbg
+    return int(icon_id or 0)
+
+
+def _mask_debug_info(mask_key):
+    key = str(mask_key or "").strip()
+    if not key:
+        return {"path": "", "image_icon_id": 0, "error": ""}
+    return dict(_MASK_UI_DEBUG.get(key) or {})
+
+
+def _get_mask_selection_for_role(props, role, slot=None):
+    try:
+        data = json.loads(getattr(props, "mask_selection_json", "") or "")
+    except Exception:
+        data = {}
+    if isinstance(data, dict):
+        val = str(data.get(str(role)) or "").strip()
+        if val:
+            return val
+    if isinstance(slot, dict):
+        return str(slot.get("mask") or "").strip()
+    return ""
+
+
+def _clamp01(v):
+    try:
+        x = float(v)
+    except Exception:
+        return 0.0
+    if x < 0.0:
+        return 0.0
+    if x > 1.0:
+        return 1.0
+    return x
+
+
+def _bar(value, width=10):
+    x = _clamp01(value)
+    n = max(1, int(width))
+    fill = int(round(x * n))
+    if fill < 0:
+        fill = 0
+    if fill > n:
+        fill = n
+    return "■" * fill + "·" * (n - fill)
+
+
+def _mini_blocks(vec, dims=(0, 1, 2, 4)):
+    blocks = "▁▂▃▄▅▆▇█"
+    out = []
+    for i in dims:
+        v = 0.0
+        if isinstance(vec, list) and len(vec) > i:
+            v = _clamp01(vec[i])
+        idx = int(round(v * (len(blocks) - 1)))
+        if idx < 0:
+            idx = 0
+        if idx >= len(blocks):
+            idx = len(blocks) - 1
+        out.append(blocks[idx])
+    return "".join(out)
+
+
+def _entry_struct_data(entry, lm):
+    if not isinstance(entry, dict):
+        return None
+    try:
+        lm.ensure_entry_complexity(entry)
+    except Exception:
+        pass
+    vec = entry.get("k_vector")
+    if not isinstance(vec, list) or len(vec) < 6:
+        return None
+    vec = [float(x) for x in vec[:6]]
+    complexity = _clamp01(entry.get("complexity_norm", vec[0]))
+    return {"vec": vec, "complexity": complexity}
+
 
 class MATCOMPOSER_PT_Panel(bpy.types.Panel):
     bl_label = "MatComposer"
@@ -22,19 +203,19 @@ class MATCOMPOSER_PT_Panel(bpy.types.Panel):
 
         # API Key
         layout.prop(props, "api_key")
-        
+
         # Model Selection (Auto-switched, hidden from UI)
         # layout.prop(props, "model_selection")
-        
+
         # Debug Mode
         layout.prop(props, "debug_mode")
 
         # Asset Libraries
         layout.label(text="Material Library:")
         layout.operator("matcomposer.scan_library", text="Scan Asset Libraries", icon='ASSET_MANAGER')
-        
+
         layout.separator()
-        
+
         # Prompt
         layout.label(text="Description:")
         layout.prop(props, "text_prompt", text="")
@@ -87,9 +268,9 @@ class MATCOMPOSER_PT_Panel(bpy.types.Panel):
                             box.label(text=f"  - {stags_preview}")
             else:
                 box.label(text="(Invalid semantic JSON)")
-        
+
         layout.separator()
-        
+
         if props.is_generating:
             layout.label(text=props.generation_status, icon='TIME')
         else:
@@ -97,7 +278,7 @@ class MATCOMPOSER_PT_Panel(bpy.types.Panel):
             row.enabled = bool(props.semantic_plan_json) and bool(props.text_prompt) and (not props.is_generating)
             row.operator("matcomposer.generate_material", text="Search Slots", icon='VIEWZOOM')
             layout.label(text=props.generation_status)
-            
+
         if props.semantic_plan_json and library_ready:
             layout.separator()
             plan = None
@@ -110,10 +291,10 @@ class MATCOMPOSER_PT_Panel(bpy.types.Panel):
                 row = layout.row()
                 row.enabled = (not props.is_generating)
                 row.operator("matcomposer.load_candidate_previews", text="Refresh Previews", icon='FILE_REFRESH')
-                
+
                 # Exploration Mode Selector
                 row.prop(props, "exploration_mode", text="")
-                
+
                 slots = plan.get("slots") or []
                 if isinstance(slots, list) and slots:
                     role_to_slot = {}
@@ -164,10 +345,10 @@ class MATCOMPOSER_PT_Panel(bpy.types.Panel):
                         row = box.row(align=True)
                         can_explore = (not props.is_generating) and library_ready
                         row.enabled = can_explore
-                        
+
                         op = row.operator("matcomposer.explore_auto", text="Explore", icon='VIEWZOOM')
                         op.role = role
-                        
+
                         sub = row.row(align=True)
                         sub.enabled = bool(getattr(props, "last_search_state_json", "")) and (not props.is_generating)
                         # Revert is currently global (undo last step), but placing it here provides context.
@@ -182,7 +363,15 @@ class MATCOMPOSER_PT_Panel(bpy.types.Panel):
                             entry = library_manager.library_manager.get_entry_by_id(curr_id)
                             if entry:
                                 box.label(text=f"Selected: {entry.get('name')}")
-                                
+                                lm = library_manager.library_manager
+                                sdata = _entry_struct_data(entry, lm)
+                                if sdata:
+                                    v = sdata["vec"]
+                                    c = sdata["complexity"]
+                                    box.label(text=f"Complexity {c:.2f}  {_bar(c, 12)}")
+                                    box.label(text=f"N {_bar(v[0], 8)}  D {_bar(v[1], 8)}")
+                                    box.label(text=f"B {_bar(v[2], 8)}  P {_bar(v[4], 8)}")
+
                                 # Structural Difference Explanation
                                 prev_id = str(props.prev_selected_entry_id or "")
                                 if prev_id and prev_id != curr_id:
@@ -191,6 +380,19 @@ class MATCOMPOSER_PT_Panel(bpy.types.Panel):
                                         diff_text = library_manager.library_manager.get_structural_diff_explanation(prev_entry, entry)
                                         if diff_text:
                                             box.label(text=diff_text, icon='INFO')
+
+                        show_mask = bool(role != "Base" or relation != "base")
+                        llm_mask = str(slot.get("mask") or "").strip() if show_mask else ""
+                        curr_mask = _get_mask_selection_for_role(props, role, slot=slot) if show_mask else ""
+                        mask_items = _mask_items_for_ui() if show_mask else []
+                        current_item = None
+                        if show_mask:
+                            for item in mask_items:
+                                if str(item.get("key") or "") == curr_mask:
+                                    current_item = item
+                                    break
+                            if current_item is None:
+                                current_item = mask_items[0] if mask_items else {"key": "", "label": "No Mask", "icon_id": 0}
 
                         ids = candidates_by_role.get(role) if isinstance(candidates_by_role, dict) else None
                         if not isinstance(ids, list):
@@ -226,7 +428,7 @@ class MATCOMPOSER_PT_Panel(bpy.types.Panel):
                                 tile_w = float(inner_w) / float(columns)
                                 # base_row_px adjusted to 26.0 to reduce height slightly (avoid "too tall" feel)
                                 # Larger denominator = smaller scale = smaller height
-                                base_row_px = 26.0 
+                                base_row_px = 26.0
                                 tile_scale_y = tile_w / base_row_px
                                 if tile_scale_y < 1.0:
                                     tile_scale_y = 1.0
@@ -252,7 +454,7 @@ class MATCOMPOSER_PT_Panel(bpy.types.Panel):
                                         icon_id = int(entry.get("_mc_preview_icon_id") or 0)
                                     except Exception:
                                         icon_id = 0
-                                    
+
                                     # Fallback to direct image load if icon_id fails
                                     if icon_id <= 0:
                                         try:
@@ -261,11 +463,11 @@ class MATCOMPOSER_PT_Panel(bpy.types.Panel):
                                             preview_img = None
 
                                 col = flow.column(align=True)
-                                
+
                                 # 1. Render Preview (Image or Icon)
                                 # We separate preview from the button because operator icons cannot be arbitrarily scaled.
                                 is_selected = bool(curr_id and str(curr_id) == str(eid))
-                                
+
                                 if icon_id > 0:
                                     # Use template_icon with scale to create a large square preview
                                     # Removing container scaling (scale_y/scale_x) to prevent double scaling or layout stretching
@@ -286,7 +488,7 @@ class MATCOMPOSER_PT_Panel(bpy.types.Panel):
                                 label = name
                                 if len(label) > 18:
                                     label = label[:17] + "…"
-                                
+
                                 sub = col.column(align=True)
                                 sub.scale_y = 1.2
                                 op = sub.operator(
@@ -297,8 +499,37 @@ class MATCOMPOSER_PT_Panel(bpy.types.Panel):
                                 )
                                 op.role = role
                                 op.entry_id = str(eid)
+                                if isinstance(entry, dict):
+                                    sdata = _entry_struct_data(entry, lm)
+                                    if sdata:
+                                        vec = sdata["vec"]
+                                        mini = _mini_blocks(vec, dims=(0, 1, 2, 4))
+                                        col.label(text=f"C {sdata['complexity']:.2f}  NDBP {mini}")
                         else:
                             box.label(text="No candidates yet. Click Search Slots.")
+
+                        if show_mask:
+                            box.separator()
+                            box.label(text="Mask")
+                            if llm_mask:
+                                box.label(text=f"LLM Mask: {llm_mask}")
+
+                            current_box = box.box()
+                            icon_id = int(current_item.get("icon_id") or 0)
+                            if icon_id > 0:
+                                current_box.template_icon(icon_value=icon_id, scale=5.0)
+                            else:
+                                current_box.label(text="", icon='TEXTURE')
+                            open_picker = current_box.operator(
+                                "matcomposer.open_mask_picker",
+                                text=str(current_item.get("label") or "No Mask"),
+                                icon_value=icon_id if icon_id > 0 else 0,
+                            )
+                            open_picker.role = role
+                            if curr_mask:
+                                box.label(text=f"Using Mask: {curr_mask}")
+                            else:
+                                box.label(text="Using Mask: none")
 
 class MATCOMPOSER_PT_Exploration(bpy.types.Panel):
     bl_label = "Exploration & Evolution"
@@ -311,71 +542,16 @@ class MATCOMPOSER_PT_Exploration(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         props = context.scene.mat_composer
-        obj = context.active_object
-        has_active_material = bool(obj and getattr(obj, "active_material", None))
         library_ready = bool(library_manager.library_manager.index_data)
         semantic_ready = bool(props.semantic_plan_json)
-        can_explore = (not props.is_generating) and semantic_ready and library_ready
 
         layout.label(text="Library Exploration:")
-        # col = layout.column()
-        # col.enabled = semantic_ready
-        # col.prop(props, "apply_slot_role", text="Apply Slot")
-        # row = layout.row(align=True)
-        # row.enabled = semantic_ready
-        # row.prop(props, "lock_base_slot")
-        # row.prop(props, "lock_overlay_slot")
-        # row.prop(props, "lock_detail_slot")
-        # row = layout.row(align=True)
-        # row.enabled = can_explore
-        # row.operator("matcomposer.explore_auto", icon='VIEWZOOM')
-        # sub = row.row(align=True)
-        # sub.enabled = bool(getattr(props, "last_search_state_json", "")) and (not props.is_generating)
-        # sub.operator("matcomposer.revert_search_state", text="Revert", icon='BACK')
 
         row = layout.row()
         row.enabled = semantic_ready and library_ready and (not props.is_generating)
         row.operator("matcomposer.assemble_slots", icon='NODE_MATERIAL')
         row = layout.row()
         row.prop(props, "force_external_mapping", text="Force External UV Mapping")
-        
-        # 1. Local Exploration (Variants)
-        layout.label(text="Local Exploration:")
-        row = layout.row()
-        row.enabled = (not props.is_generating) and has_active_material
-        row.operator("matcomposer.generate_variants", icon='GHOST_ENABLED')
-        
-        # Grid View for Variants
-        if props.variant_1_params: # Only show if variants exist
-            grid = layout.grid_flow(row_major=True, columns=2, align=True)
-            r1 = grid.row(align=True)
-            r1.enabled = (not props.is_generating) and has_active_material
-            r1.operator("matcomposer.apply_variant", text="Variant 1").variant_index = 1
-            r2 = grid.row(align=True)
-            r2.enabled = (not props.is_generating) and has_active_material
-            r2.operator("matcomposer.apply_variant", text="Variant 2").variant_index = 2
-            r3 = grid.row(align=True)
-            r3.enabled = (not props.is_generating) and has_active_material
-            r3.operator("matcomposer.apply_variant", text="Variant 3").variant_index = 3
-            r4 = grid.row(align=True)
-            r4.enabled = (not props.is_generating) and has_active_material
-            r4.operator("matcomposer.apply_variant", text="Variant 4").variant_index = 4
-            
-        layout.separator()
-        
-        # 2. Directional Extrapolation
-        layout.label(text="Directional Extrapolation:")
-        
-        # Enable only if we have enough history
-        row = layout.row()
-        if props.current_history_index < 1 or props.is_generating or not has_active_material:
-            row.enabled = False
-            
-        row.operator("matcomposer.evolve", icon='FORCE_MAGNETIC')
-        
-        # History Info
-        if props.current_history_index >= 0:
-            layout.label(text=f"Step: {props.current_history_index + 1} / {len(props.history)}", icon='TIME')
 
 classes = [
     MATCOMPOSER_PT_Panel,
@@ -387,5 +563,15 @@ def register():
         bpy.utils.register_class(cls)
 
 def unregister():
+    global _MASK_UI_IMAGE_CACHE, _MASK_UI_DEBUG
+    try:
+        for img in list(_MASK_UI_IMAGE_CACHE.values()):
+            img_name = str(getattr(img, "name", "") or "")
+            if img and img_name and bpy.data.images.get(img_name) is not None:
+                bpy.data.images.remove(img)
+    except Exception:
+        pass
+    _MASK_UI_IMAGE_CACHE = {}
+    _MASK_UI_DEBUG = {}
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)

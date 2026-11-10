@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (C) 2026 MatComposer authors
+
 import hashlib
 import json
 import math
@@ -16,6 +19,7 @@ class SlotSpec:
     concept: str
     tags: Tuple[str, ...]
     relation: str
+    mask: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -23,6 +27,7 @@ class SlotSpec:
             "concept": self.concept,
             "tags": list(self.tags),
             "relation": self.relation,
+            "mask": self.mask,
         }
 
 
@@ -59,6 +64,19 @@ def _stable_unit_hash(token: str) -> float:
     return (x / (2**64 - 1)) * 2.0 - 1.0
 
 
+def _char_ngrams(token: str) -> List[str]:
+    t = str(token or "").strip().lower()
+    if len(t) < 4:
+        return [t] if t else []
+    grams: List[str] = []
+    for n in (3, 4):
+        if len(t) < n:
+            continue
+        for i in range(0, len(t) - n + 1):
+            grams.append(t[i : i + n])
+    return grams
+
+
 def embed_tokens(tokens: List[str], dim: int = DEFAULT_EMBED_DIM) -> List[float]:
     if dim <= 0:
         raise ValueError("dim must be positive")
@@ -67,11 +85,22 @@ def embed_tokens(tokens: List[str], dim: int = DEFAULT_EMBED_DIM) -> List[float]
         return v
 
     for tok in tokens:
+        tok = str(tok or "").strip().lower()
+        if not tok:
+            continue
         h = hashlib.sha256(tok.encode("utf-8")).digest()
         for i in range(0, 32, 2):
             idx = h[i] % dim
             sgn = 1.0 if (h[i + 1] & 1) == 0 else -1.0
             v[idx] += sgn * (0.5 + abs(_stable_unit_hash(tok)) * 0.5)
+        grams = _char_ngrams(tok)
+        if grams:
+            for g in grams:
+                gh = hashlib.sha256(g.encode("utf-8")).digest()
+                for i in range(0, 32, 2):
+                    idx = gh[i] % dim
+                    sgn = 1.0 if (gh[i + 1] & 1) == 0 else -1.0
+                    v[idx] += sgn * (0.18 + abs(_stable_unit_hash(g)) * 0.12)
     return _l2_normalize(v)
 
 
@@ -128,12 +157,12 @@ def build_slots_fallback(text: str, tags: List[str]) -> List[SlotSpec]:
     if is_overlay and len(tags) >= 2:
         base_tags = tuple(tags[: max(1, len(tags) // 2)])
         overlay_tags = tuple(tags[len(base_tags) :]) or tuple(tags[:2])
-        slots.append(SlotSpec(role="Base", concept=base_tags[0], tags=base_tags, relation="base"))
-        slots.append(SlotSpec(role="Overlay", concept=overlay_tags[0], tags=overlay_tags, relation="overlay"))
+        slots.append(SlotSpec(role="Base", concept=base_tags[0], tags=base_tags, relation="base", mask=""))
+        slots.append(SlotSpec(role="Overlay", concept=overlay_tags[0], tags=overlay_tags, relation="overlay", mask=""))
         return slots[:MAX_SLOTS]
 
     primary = tags[0] if tags else (tokens[0] if tokens else "material")
-    slots.append(SlotSpec(role="Base", concept=primary, tags=tuple(tags)[:8], relation="base"))
+    slots.append(SlotSpec(role="Base", concept=primary, tags=tuple(tags)[:8], relation="base", mask=""))
     return slots
 
 
@@ -163,7 +192,8 @@ def build_representation_from_semantic_json(
             stags = [str(t).strip().lower() for t in stags if str(t).strip()]
             stags = list(dict.fromkeys(stags))[:12]
             relation = str(s.get("relation") or "").strip() or "base"
-            slots.append(SlotSpec(role=role, concept=concept, tags=tuple(stags), relation=relation))
+            mask = str(s.get("mask") or "").strip().lower()
+            slots.append(SlotSpec(role=role, concept=concept, tags=tuple(stags), relation=relation, mask=mask))
 
     if not slots:
         slots = build_slots_fallback(raw_text, tags)
@@ -194,12 +224,12 @@ def build_k_topology_from_node_tree(node_tree: Any) -> Dict[str, Any]:
     tex_pattern_nodes = 0  # Procedural generators (Noise, Voronoi, ...)
     tex_image_nodes = 0    # Bitmap/Image textures
     math_nodes = 0         # Math / transform / mix density
-    
+
     # Keyword sets for classification
     # Note: These are based on Blender's internal bl_idname
     procedural_keywords = {
-        "ShaderNodeTexNoise", "ShaderNodeTexVoronoi", "ShaderNodeTexWave", 
-        "ShaderNodeTexMusgrave", "ShaderNodeTexBrick", "ShaderNodeTexChecker", 
+        "ShaderNodeTexNoise", "ShaderNodeTexVoronoi", "ShaderNodeTexWave",
+        "ShaderNodeTexMusgrave", "ShaderNodeTexBrick", "ShaderNodeTexChecker",
         "ShaderNodeTexGradient", "ShaderNodeTexMagic", "ShaderNodeTexWhiteNoise",
         "ShaderNodeTexGabor",
     }
@@ -222,10 +252,10 @@ def build_k_topology_from_node_tree(node_tree: Any) -> Dict[str, Any]:
         ntype = getattr(n, "bl_idname", "") or getattr(n, "type", "")
         ntype = str(ntype)
         type_counts[ntype] = type_counts.get(ntype, 0) + 1
-        
+
         if ntype == "ShaderNodeGroup" or ntype == "GROUP":
             group_nodes += 1
-        
+
         up = ntype.upper()
 
         if ntype in image_keywords or "IMAGE" in up or "ENVIRONMENT" in up:
@@ -234,7 +264,7 @@ def build_k_topology_from_node_tree(node_tree: Any) -> Dict[str, Any]:
             tex_pattern_nodes += 1
         elif ntype.startswith("ShaderNodeTex") and ntype not in image_keywords and ntype != "ShaderNodeTexCoord":
             tex_pattern_nodes += 1
-            
+
         if ntype in math_keywords or any(k in up for k in ("MATH", "MIX", "MAPRANGE", "SEPARATE", "COMBINE", "CLAMP")):
             math_nodes += 1
 
@@ -248,25 +278,25 @@ def build_k_topology_from_node_tree(node_tree: Any) -> Dict[str, Any]:
         to_name = link.to_node.name
         if from_name in adj:
             adj[from_name].append(to_name)
-    
+
     # 2. Compute Longest Path using Memoization
     memo = {}
     def get_depth(node_name):
         if node_name in memo:
             return memo[node_name]
-        
+
         max_child_depth = 0
         if node_name in adj:
             for child in adj[node_name]:
                 # Simple cycle detection prevention (max depth clamp)
                 # In a valid Blender material, cycles shouldn't exist, but safety first
                 max_child_depth = max(max_child_depth, get_depth(child))
-        
+
         memo[node_name] = 1 + max_child_depth
         return memo[node_name]
 
     max_depth = 0
-    # We can iterate all nodes, but to be faster we could start from roots. 
+    # We can iterate all nodes, but to be faster we could start from roots.
     # For robustness, just iterate all.
     # Limit recursion depth to avoid crashes on malformed graphs
     try:
@@ -280,7 +310,7 @@ def build_k_topology_from_node_tree(node_tree: Any) -> Dict[str, Any]:
         max_depth = 1  # Fallback
 
     node_count = len(nodes)
-    
+
     return {
         "node_count": node_count,
         "link_count": len(links),
@@ -307,11 +337,11 @@ def get_structural_vector(rep: MaterialRepresentation) -> List[float]:
     k = rep.k_topology
     if not k:
         return [0.0] * 6
-        
+
     node_count = float(k.get("node_count", 0))
     if node_count <= 0:
         return [0.0] * 6
-        
+
     # 1. Node Count: Logarithmic normalization (0-200 nodes -> 0-1)
     node_count_norm = math.log1p(node_count) / math.log1p(200)
     node_count_norm = max(0.0, min(1.0, node_count_norm))
@@ -324,7 +354,7 @@ def get_structural_vector(rep: MaterialRepresentation) -> List[float]:
     # 3. Branching Factor
     link_count = float(k.get("link_count", 0))
     # Average links per node. Usually 1.0-2.0.
-    branching = (link_count / node_count) / 2.0 
+    branching = (link_count / node_count) / 2.0
     branching = max(0.0, min(1.0, branching))
 
     # 4-b) Main-path Dominance
@@ -340,7 +370,7 @@ def get_structural_vector(rep: MaterialRepresentation) -> List[float]:
     math_count = float(k.get("math_node_count", 0))
     math_ratio = math_count / node_count
     math_ratio = max(0.0, min(1.0, math_ratio))
-    
+
     return [
         node_count_norm,
         depth_norm,
@@ -381,7 +411,8 @@ def json_str_to_representation(s: str) -> Optional[MaterialRepresentation]:
         if not isinstance(stags, list):
             stags = []
         relation = str(sd.get("relation") or "base")
-        slot_specs.append(SlotSpec(role=role, concept=concept, tags=tuple(str(t) for t in stags), relation=relation))
+        mask = str(sd.get("mask") or "").strip().lower()
+        slot_specs.append(SlotSpec(role=role, concept=concept, tags=tuple(str(t) for t in stags), relation=relation, mask=mask))
 
     try:
         vec = tuple(float(x) for x in s_vec)

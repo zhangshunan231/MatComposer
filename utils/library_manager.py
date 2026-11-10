@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (C) 2026 MatComposer authors
+
 import json
 import os
 import bpy
@@ -382,7 +385,7 @@ class LibraryManager:
     def _save_pixels_to_png(self, pixels, width, height, filepath):
         if not pixels or width <= 0 or height <= 0:
             return False
-        
+
         # Convert ints to floats if needed
         # preview.image_pixels is usually int list
         if isinstance(pixels[0], int):
@@ -399,7 +402,7 @@ class LibraryManager:
             temp_name = f"temp_thumb_{os.path.basename(filepath)}"
             if temp_name in bpy.data.images:
                 bpy.data.images.remove(bpy.data.images[temp_name])
-            
+
             temp_img = bpy.data.images.new(temp_name, width, height, alpha=True)
             temp_img.pixels = f_pixels
             temp_img.filepath_raw = filepath
@@ -427,7 +430,7 @@ class LibraryManager:
                 except Exception:
                     icon_id = 0
                 return icon_id
-            
+
             thumb = pcoll.load(entry_id, path, 'IMAGE', force_reload=bool(force_reload))
             return thumb.icon_id
         except Exception as e:
@@ -475,11 +478,11 @@ class LibraryManager:
     def ensure_entry_preview_icon_id(self, entry):
         if not isinstance(entry, dict):
             return 0
-        
+
         entry_id = str(entry.get("id") or "")
         if not entry_id:
             return 0
-            
+
         # 1. Try Disk Cache
         thumb_path = self._get_thumb_path(entry)
         if os.path.exists(thumb_path):
@@ -492,7 +495,7 @@ class LibraryManager:
 
         # 2. Slow Path: Load Material
         self._cleanup_preview_materials()
-        
+
         asset_type = str(entry.get("asset_type") or "MATERIAL")
         full_path = entry.get("full_path")
         source_path = entry.get("source_path") or full_path
@@ -548,13 +551,13 @@ class LibraryManager:
         finally:
             try:
                 # Always remove loaded material if we saved to disk or failed
-                # If we fell back to session ID, we might need to keep it? 
+                # If we fell back to session ID, we might need to keep it?
                 # Actually, if we use session ID, we called _remember_preview_material
-                # which keeps it in LRU. 
+                # which keeps it in LRU.
                 # If we saved to disk, we can remove it.
-                
+
                 saved_to_disk = os.path.exists(thumb_path) and icon_id > 0
-                
+
                 should_remove = False
                 if loaded and loaded.name not in existing_names:
                      if saved_to_disk:
@@ -563,7 +566,7 @@ class LibraryManager:
                          should_remove = True
                      elif loaded.name not in self._preview_material_lru:
                          should_remove = True
-                         
+
                 if should_remove:
                     bpy.data.materials.remove(loaded, do_unlink=True)
             except Exception:
@@ -620,7 +623,7 @@ class LibraryManager:
                 parts = [p.strip() for p in v.replace(",", " ").split(" ") if p.strip()]
                 return parts
         return []
-        
+
     def _normalize_catalog_uuid(self, value):
         s = str(value or "").strip()
         if not s:
@@ -867,12 +870,12 @@ class LibraryManager:
                 if file.endswith(".blend"):
                     full_path = os.path.join(root, file)
                     # rel_path = os.path.relpath(full_path, folder_path)
-                    
+
                     added = self._scan_blend_file(full_path, library_name, catalog_map, catalog_prefix=catalog_prefix)
                     if added:
                         count += added
         return count
-        
+
     def _scan_blend_file(self, full_path, library_name, catalog_map, catalog_prefix=None):
         """Extract material info from a single blend file."""
         added_count = 0
@@ -981,7 +984,7 @@ class LibraryManager:
                         tag_bucket.append(filename)
                     if requested_name:
                         tag_bucket.append(requested_name)
-                    
+
                     if asset_tags:
                         tag_bucket.extend(asset_tags)
 
@@ -1020,7 +1023,7 @@ class LibraryManager:
             except Exception:
                 size = 0
             print(f"[MatComposer] Failed to read {full_path}: {msg} | size={size} | header={header!r}")
-            
+
         return added_count
 
     def get_all_templates(self):
@@ -1052,17 +1055,17 @@ class LibraryManager:
         """Search templates by query (Simple RAG Lite)."""
         if not query:
             return self.get_all_templates()[:limit]
-            
+
         query_terms = query.lower().split()
         scored_items = []
-        
+
         for item in self.index_data:
             score = 0
             # Simple scoring: +10 for name match, +1 for description/tag match
             name = item.get("name", "").lower()
             desc = item.get("description", "").lower()
             tags = [t.lower() for t in item.get("tags", [])]
-            
+
             for term in query_terms:
                 if term in name:
                     score += 10
@@ -1070,14 +1073,17 @@ class LibraryManager:
                     score += 1
                 for tag in tags:
                     if term in tag:
-                        score += 2
-                        
+                        tag_score = 2
+                        if tag.startswith(("cat:", "category:", "type:", "substrate:")):
+                            tag_score = 6
+                        score += tag_score
+
             if score > 0:
                 scored_items.append((score, item))
-        
+
         # Sort by score desc
         scored_items.sort(key=lambda x: x[0], reverse=True)
-        
+
         # Return top N formatted
         templates = []
         for score, item in scored_items[:limit]:
@@ -1088,9 +1094,9 @@ class LibraryManager:
                 "description": item.get("description", ""),
                 "tags": item.get("tags", [])
             })
-            
+
         return templates
-        
+
     def get_entry_by_id(self, template_id):
         if not template_id:
             return None
@@ -1130,7 +1136,7 @@ class LibraryManager:
             # Fallback for safety
             nodes = int(topology) if isinstance(topology, (int, float)) else 0
             topology = {"node_count": nodes}
-        
+
         entry["k_topology"] = topology
         nodes = topology.get("node_count", 0)
 
@@ -1149,7 +1155,6 @@ class LibraryManager:
         entry["complexity_norm"] = self._normalize_complexity(nodes)
         return float(entry["complexity_norm"])
 
-
     def get_structural_info(self, entry):
         """
         Returns structural badges info for UI display.
@@ -1157,11 +1162,11 @@ class LibraryManager:
         """
         if not isinstance(entry, dict):
             return []
-        
+
         vec = entry.get("k_vector")
         if not vec or len(vec) < 6:
             return []
-            
+
         # 6-dim vector:
         # 0. Node Count (0-1)
         # 1. Structure Depth (0-1)
@@ -1169,9 +1174,9 @@ class LibraryManager:
         # 3. Main-path Dominance (0-1)
         # 4. Procedural Generator Ratio (0-1)
         # 5. Math-Transform Ratio (0-1)
-        
+
         badges = []
-        
+
         # Helper to format level
         def get_level(val):
             if val < 0.3: return "L", (0.5, 0.5, 0.5, 1.0) # Low
@@ -1193,7 +1198,7 @@ class LibraryManager:
         # Procedural Generator Ratio
         lvl, col = get_level(vec[4])
         badges.append({'label': f"P:{lvl}", 'value': vec[4], 'desc': f"Procedural: {vec[4]:.2f}", 'color': col})
-        
+
         return badges
 
     def get_structural_diff_explanation(self, entry_a, entry_b):
@@ -1203,25 +1208,25 @@ class LibraryManager:
         """
         if not entry_a or not entry_b:
             return "No comparison data."
-            
+
         vec_a = entry_a.get("k_vector", [0] * 6)
         vec_b = entry_b.get("k_vector", [0] * 6)
-        
+
         if len(vec_a) < 6 or len(vec_b) < 6:
             return "Missing structural data."
-            
+
         diffs = []
         labels = ["Node Count", "Depth", "Branching", "Main-path", "Procedural", "Math-Transform"]
-        
+
         for i, label in enumerate(labels):
             delta = vec_b[i] - vec_a[i]
             if abs(delta) > 0.15: # Significant change threshold
                 direction = "increased" if delta > 0 else "decreased"
                 diffs.append(f"{label} {direction} ({delta:+.2f})")
-                
+
         if not diffs:
             return "Structure is similar."
-            
+
         return "Changes: " + ", ".join(diffs)
 
     def _normalize_complexity(self, node_count):

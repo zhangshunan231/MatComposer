@@ -1,0 +1,10 @@
+* text=auto
+*.py text eol=lf
+*.md text eol=lf
+*.toml text eol=lf
+*.cff text eol=lf
+*.bib text eol=lf
+*.blend binary
+*.jpg binary
+*.png binary
+.github export-ignore

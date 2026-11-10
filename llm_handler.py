@@ -1,7 +1,13 @@
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (C) 2026 MatComposer authors
+
 import json
 import urllib.request
 import urllib.error
 import datetime
+import ssl
+import socket
+import time
 
 SYSTEM_PROMPT = """You are MatComposer, an expert technical artist in Blender. Your goal is to generate procedural PBR materials using Shader Nodes. You must output ONLY valid JSON describing the node graph topology and parameters. Do not use Markdown blocks. The JSON structure must strictly follow the schema provided.
 
@@ -33,12 +39,12 @@ JSON Schema:
 
 SEMANTIC_SYSTEM_PROMPT = """You are MatComposer. Convert the user's raw text into a compact set of visual semantic tags and a 1-3 slot decomposition plan for a procedural material system.
 
-Semantic taxonomy vectors:
-1) Material Categories: Metal, Stone, Wood, Fabric, Marble, Cast Iron, Silk, Concrete
-2) Stylistic Attributes: Realistic, Toon, Stylized, Cyberpunk, Ancient, Modern, Futuristic
-3) Surface States: Rusted, Worn, Cracked, Scratched, Mossy, Snowy, Dusty, Wet, Dry
-4) Physical Perceptions: Rough, Smooth, Viscous, Glowing, Translucent, Metallic, Matte
-5) Usage Scenarios: Floor, Wall, Roof, Armor, Terrain, Prop, Interior, Exterior
+Semantic taxonomy vectors (preferred vocabulary, examples not exhaustive):
+1) Material Categories: metal, stone, wood, fabric, marble, cast iron, silk, concrete
+2) Stylistic Attributes: realistic, toon, stylized, cyberpunk, ancient, modern, futuristic
+3) Surface States: rusted, worn, cracked, scratched, mossy, snowy, dusty, wet, dry
+4) Physical Perceptions: rough, smooth, viscous, glowing, translucent, metallic, matte
+5) Usage Scenarios: floor, wall, roof, armor, terrain, prop, interior, exterior
 
 Output ONLY valid JSON. No Markdown. No extra keys beyond the schema.
 
@@ -51,7 +57,8 @@ Schema:
       "role": "Base|Overlay|Detail",
       "concept": "short noun phrase",
       "tags": ["lowercase tags, 3-10 items"],
-      "relation": "base|overlay|detail"
+      "relation": "base|overlay|detail",
+      "mask": "optional lowercase mask preference or empty string"
     }
   ]
 }
@@ -60,8 +67,15 @@ Rules:
 - slot_count must be 1..3 and equal to slots.length
 - For common compound materials (e.g. rusty metal), split into Base + Overlay
 - Prefer concrete appearance words (metal, rust, brushed, wet, dusty, scratched, painted, etc.)
+- Prefer tags from the vocabulary above when they fit, but do not treat the examples as a closed list
+- You may introduce additional short visual tags when they are clearly more accurate or more useful for retrieval
+- Favor reusable visual terms over poetic or subjective wording
 - Keep tags short and deduplicated
+- Normalize obvious synonyms toward the preferred vocabulary when possible
 - When applicable, include tags that cover multiple vectors above; prefer the closest matching keywords
+- For overlay/detail slots, you may suggest a mask preference when it is visually obvious
+- Preferred mask vocabulary: edge_mask, peeling_mask, splatter_mask, cell_mask, crack_mask, normal_mask, ao_mask, generated_mask
+- For base slots, usually leave mask as an empty string
 """
 
 class LLMClient:
@@ -69,6 +83,8 @@ class LLMClient:
         self.api_key = api_key
         self.model = model
         self.api_url = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+        self.timeout = 45
+        self.max_retries = 3
 
     def _build_messages(self, system_prompt, user_text, image_data_url=None):
         if image_data_url:
@@ -96,21 +112,48 @@ class LLMClient:
             print(json.dumps(data, indent=2, ensure_ascii=False))
             print("---------------------------------")
 
-        try:
-            req = urllib.request.Request(
-                self.api_url,
-                data=json.dumps(data).encode('utf-8'),
-                headers=headers
-            )
+        payload = json.dumps(data).encode('utf-8')
+        ssl_ctx = ssl.create_default_context()
+        last_error = ""
 
-            with urllib.request.urlopen(req) as response:
-                result = json.loads(response.read().decode('utf-8'))
-                content = result['choices'][0]['message']['content']
-                return content, result
-        except urllib.error.HTTPError as e:
-            return None, {"error": f"HTTP Error: {e.code} - {e.reason}"}
-        except Exception as e:
-            return None, {"error": f"Error: {str(e)}"}
+        for attempt in range(1, int(self.max_retries) + 1):
+            try:
+                req = urllib.request.Request(
+                    self.api_url,
+                    data=payload,
+                    headers=headers
+                )
+                with urllib.request.urlopen(req, timeout=self.timeout, context=ssl_ctx) as response:
+                    result = json.loads(response.read().decode('utf-8'))
+                    content = result['choices'][0]['message']['content']
+                    return content, result
+            except urllib.error.HTTPError as e:
+                return None, {"error": f"HTTP Error: {e.code} - {e.reason}"}
+            except urllib.error.URLError as e:
+                reason = getattr(e, "reason", e)
+                last_error = str(reason)
+            except (ssl.SSLError, socket.timeout, TimeoutError, ConnectionResetError) as e:
+                last_error = str(e)
+            except Exception as e:
+                last_error = str(e)
+
+            if attempt < int(self.max_retries):
+                if debug:
+                    now = datetime.datetime.now().strftime("%H:%M:%S")
+                    print(f"[{now}] [MatComposer DEBUG] Request retry {attempt}/{self.max_retries - 1}: {last_error}")
+                time.sleep(0.8 * attempt)
+
+        lowered = str(last_error).lower()
+        if "unexpected_eof_while_reading" in lowered or "eof occurred in violation of protocol" in lowered:
+            msg = (
+                "SSL connection to DashScope was interrupted during response read. "
+                "This is usually a transient network/TLS issue. Please retry."
+            )
+        elif "timed out" in lowered:
+            msg = "Request to DashScope timed out. Please retry."
+        else:
+            msg = f"Network Error: {last_error}" if last_error else "Network Error"
+        return None, {"error": msg}
 
     def generate_material(self, user_prompt, templates=None, image_data_url=None, debug=False):
         final_prompt = user_prompt
@@ -143,10 +186,10 @@ class LLMClient:
             content = content[7:]
         elif content.startswith("```"):
             content = content[3:]
-        
+
         if content.endswith("```"):
             content = content[:-3]
-        
+
         try:
             return json.loads(content)
         except json.JSONDecodeError as e:

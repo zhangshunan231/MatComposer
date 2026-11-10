@@ -1,63 +1,41 @@
-import bpy
-import os
-import subprocess
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (C) 2026 MatComposer authors
+
+"""Clear asset tags in an explicitly opened Blender file; save only with --save."""
+import argparse
 import sys
-
-
-BLENDER_EXE = r"D:\software\Blender\Blender4.4\blender.exe"
-BLEND_FILE = r"D:\Asset\Blender\MyMatLib\MyMaterials.blend"
+try:
+    import bpy
+except ImportError:
+    bpy = None
 
 
 def clear_all_asset_tags():
     materials = [m for m in bpy.data.materials if getattr(m, "asset_data", None)]
-    total = len(materials)
     removed = 0
     for mat in materials:
         tags = mat.asset_data.tags
-        try:
-            count = len(tags)
-        except Exception:
-            count = 0
-        try:
-            tags.clear()
-        except Exception:
-            for tag in list(tags):
-                try:
-                    tags.remove(tag)
-                except Exception:
-                    pass
-        removed += count
-    print(f"Cleared {removed} tags from {total} materials")
+        removed += len(tags)
+        for tag in list(tags):
+            tags.remove(tag)
+    print(f"Cleared {removed} tags from {len(materials)} materials")
 
 
 def main():
-    valid_bpy = False
-    try:
-        if bpy is not None:
-            _ = bpy.ops
-            valid_bpy = True
-    except Exception:
-        valid_bpy = False
-
-    if not valid_bpy:
-        if not os.path.exists(BLENDER_EXE):
-            print(f"Error: Blender executable not found at {BLENDER_EXE}")
-            return
-        if not os.path.exists(BLEND_FILE):
-            print(f"Error: Blend file not found at {BLEND_FILE}")
-            return
-        cmd = [BLENDER_EXE, BLEND_FILE, "--background", "--factory-startup", "-P", __file__]
-        print(f"Executing: {' '.join(cmd)}")
-        try:
-            subprocess.check_call(cmd)
-        except subprocess.CalledProcessError as e:
-            print(f"Blender process failed with exit code {e.returncode}")
-        return
-
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--save", action="store_true", help="Save the opened .blend file")
+    argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
+    args = parser.parse_args(argv)
+    if bpy is None or not hasattr(bpy, "ops"):
+        raise SystemExit("Run with: blender --background <file.blend> --python scripts/clear_asset_tags.py -- [--save]")
+    if not bpy.data.filepath:
+        raise SystemExit("Open an existing .blend file before clearing tags.")
     clear_all_asset_tags()
-    print("Saving file...")
-    bpy.ops.wm.save_mainfile()
-    print("File saved.")
+    if args.save:
+        bpy.ops.wm.save_mainfile()
+        print("File saved.")
+    else:
+        print("Changes were not saved. Pass --save to write them to the opened file.")
 
 
 if __name__ == "__main__":

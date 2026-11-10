@@ -1,0 +1,40 @@
+cff-version: 1.2.0
+message: "If you use MatComposer in your research, please cite the accompanying paper."
+type: software
+title: MatComposer
+authors:
+  - family-names: Zhang
+    given-names: Shunan
+  - family-names: Xiao
+    given-names: Yi
+  - family-names: Wei
+    given-names: Guangpeng
+  - family-names: Zhou
+    given-names: Yang
+  - family-names: Liu
+    given-names: Zeyu
+repository-code: "https://github.com/zhangshunan231/MatComposer"
+license: GPL-3.0-only
+preferred-citation:
+  type: conference-paper
+  title: "MatComposer: Structural-Semantic Retrieval and Iterative Exploration for Procedural Material Graph Authoring"
+  authors:
+    - family-names: Zhang
+      given-names: Shunan
+    - family-names: Xiao
+      given-names: Yi
+    - family-names: Wei
+      given-names: Guangpeng
+    - family-names: Zhou
+      given-names: Yang
+    - family-names: Liu
+      given-names: Zeyu
+  collection-title: Proceedings of the 39th Annual ACM Symposium on User Interface Software and Technology
+  publisher:
+    name: Association for Computing Machinery
+  year: 2026
+  month: 11
+  start: 1
+  end: 19
+  doi: 10.1145/3830398.3830601
+  url: "https://doi.org/10.1145/3830398.3830601"

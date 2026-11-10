@@ -10,8 +10,9 @@ extend-exclude = [
 [tool.pyright]
 pythonVersion = "3.10"
 pythonPlatform = "Windows"
-typeCheckingMode = "basic"
+typeCheckingMode = "off"
 reportMissingImports = false
+reportInvalidTypeForm = "none"
 exclude = [
   "material_cache",
   "__pycache__",

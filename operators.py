@@ -1,8 +1,12 @@
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (C) 2026 MatComposer authors
+
 import bpy
 import threading
 import queue
 import json
 import datetime
+import time
 import base64
 import os
 import mimetypes
@@ -16,6 +20,12 @@ result_queue = queue.Queue()
 semantic_queue = queue.Queue()
 search_queue = queue.Queue()
 preview_queue = queue.Queue()
+_SEARCH_STATE_STACK_LIMIT = 20
+
+
+def _debug_timing(enabled, message):
+    if enabled:
+        print(f"[MatComposer][Timing] {message}")
 
 def _tag_redraw_all():
     wm = getattr(bpy.context, "window_manager", None)
@@ -48,6 +58,7 @@ def _snapshot_search_state(props):
         "semantic_repr_json",
         "slot_candidates_json",
         "slot_selection_json",
+        "mask_selection_json",
         "candidate_pick_base",
         "candidate_pick_overlay",
         "candidate_pick_detail",
@@ -66,8 +77,24 @@ def _snapshot_search_state(props):
             data[k] = getattr(props, k)
         except Exception:
             data[k] = ""
+    stack = []
+    raw = getattr(props, "last_search_state_json", "")
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                stack = [x for x in parsed if isinstance(x, dict)]
+            elif isinstance(parsed, dict):
+                # Backward compatibility: old single-snapshot format.
+                stack = [parsed]
+        except Exception:
+            stack = []
+    if not stack or stack[-1] != data:
+        stack.append(data)
+    if len(stack) > int(_SEARCH_STATE_STACK_LIMIT):
+        stack = stack[-int(_SEARCH_STATE_STACK_LIMIT) :]
     try:
-        props.last_search_state_json = json.dumps(data)
+        props.last_search_state_json = json.dumps(stack)
     except Exception:
         props.last_search_state_json = ""
 
@@ -76,8 +103,17 @@ def _restore_search_state(props):
     s = getattr(props, "last_search_state_json", "")
     if not s:
         return False
+    stack = []
+    data = None
     try:
-        data = json.loads(s)
+        parsed = json.loads(s)
+        if isinstance(parsed, list):
+            stack = [x for x in parsed if isinstance(x, dict)]
+            if stack:
+                data = stack.pop()
+        elif isinstance(parsed, dict):
+            # Backward compatibility: old single-snapshot format.
+            data = parsed
     except Exception:
         return False
     if not isinstance(data, dict):
@@ -93,7 +129,47 @@ def _restore_search_state(props):
         props.is_generating = False
     except Exception:
         pass
+    try:
+        props.last_search_state_json = json.dumps(stack) if stack else ""
+    except Exception:
+        props.last_search_state_json = ""
     return True
+
+
+def _get_mask_selection_for_role(props, role):
+    data = _safe_load_json_dict(getattr(props, "mask_selection_json", ""))
+    if not isinstance(data, dict):
+        return ""
+    return str(data.get(str(role)) or "").strip()
+
+
+def _set_mask_selection_for_role(props, role, mask_key):
+    data = _safe_load_json_dict(getattr(props, "mask_selection_json", ""))
+    if not isinstance(data, dict):
+        data = {}
+    data[str(role)] = str(mask_key or "").strip()
+    try:
+        props.mask_selection_json = json.dumps(data)
+    except Exception:
+        props.mask_selection_json = ""
+
+
+def _sync_mask_defaults_from_plan(props, plan_dict):
+    slots = plan_dict.get("slots") or []
+    if not isinstance(slots, list):
+        slots = []
+    data = {}
+    for slot in slots:
+        if not isinstance(slot, dict):
+            continue
+        role = str(slot.get("role") or "").strip()
+        if not role:
+            continue
+        data[role] = str(slot.get("mask") or "").strip()
+    try:
+        props.mask_selection_json = json.dumps(data)
+    except Exception:
+        props.mask_selection_json = ""
 
 
 def _image_to_data_url(image):
@@ -212,6 +288,34 @@ def _euclidean_safe(a, b):
             return None
         s += d * d
     return s ** 0.5
+
+def _minmax_norm_map(value_map, invert=False):
+    if not isinstance(value_map, dict) or not value_map:
+        return {}
+    vals = []
+    for v in value_map.values():
+        try:
+            vals.append(float(v))
+        except Exception:
+            continue
+    if not vals:
+        return {k: 0.0 for k in value_map.keys()}
+    vmin = min(vals)
+    vmax = max(vals)
+    if abs(vmax - vmin) <= 1e-12:
+        return {k: 0.5 for k in value_map.keys()}
+    out = {}
+    for k, v in value_map.items():
+        try:
+            x = (float(v) - vmin) / (vmax - vmin)
+        except Exception:
+            x = 0.0
+        if x < 0.0:
+            x = 0.0
+        if x > 1.0:
+            x = 1.0
+        out[k] = (1.0 - x) if invert else x
+    return out
 
 def _clip_query_from_scored_ids(lm, scored_ids):
     if not isinstance(scored_ids, list) or not scored_ids:
@@ -349,7 +453,7 @@ def _gnn_directional_score(prev_gnn, curr_gnn, cand_gnn):
 def _structural_directional_score(prev_k, curr_k, cand_k):
     if not isinstance(curr_k, list) or not isinstance(cand_k, list) or not curr_k or not cand_k:
         return 0.0
-    
+
     # Pad to 6D
     dim = 6
     def _pad(v):
@@ -425,63 +529,85 @@ def _rank_entries_for_rep(lm, rep, allowed_types, complexity_target, top_k):
 
 def _finalize_ids_for_rep_with_complexity(lm, rep, ids, complexity_target):
     qv = list(rep.s_vector)
-    
-    # Prepare Structural Target (K-Vector)
-    # Current UI only has one slider for "Complexity".
-    # We map this to the first dimension of the structural vector.
-    # [NodeCount, Depth, Branching, Dominance, ProcRatio, MathRatio]
-    target_k = [float(complexity_target), 0.0, 0.0, 0.0, 0.0, 0.0]
-    
-    # We only weight the first dimension for now, as we don't have UI for others.
-    # However, if we wanted to enforce "Simple but Deep" or "Complex and Organic", 
-    # we would adjust these weights.
-    k_weights = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-
     sem_scored = []
+    id_to_entry = {}
     for eid in ids:
         entry = lm.get_entry_by_id(str(eid))
         if not entry:
             continue
+        id_key = str(entry.get("id") or "")
+        if not id_key:
+            continue
+        id_to_entry[id_key] = entry
         ev = exploration_engine.entry_vector(entry)
         d = semantic_init.euclidean(qv, ev)
         score = -d
-        sem_scored.append((float(score), str(entry.get("id") or "")))
+        sem_scored.append((float(score), id_key))
+    if not sem_scored:
+        return []
 
     clip_q = _clip_query_from_scored_ids(lm, sem_scored)
-    clip_w = 0.35 if clip_q is not None else 0.0
-
-    rescored = []
-    for score, eid in sem_scored:
-        entry = lm.get_entry_by_id(str(eid))
+    k_vecs = {}
+    for _s, eid in sem_scored:
+        entry = id_to_entry.get(eid)
         if not entry:
             continue
+        try:
+            lm.ensure_entry_complexity(entry)
+        except Exception:
+            pass
+        kv = entry.get("k_vector")
+        if not isinstance(kv, list) or not kv:
+            c = float(entry.get("complexity_norm") or 0.0)
+            kv = [c, 0.0, 0.0, 0.0, 0.0, 0.0]
+        if len(kv) < 6:
+            kv = list(kv) + [0.0] * (6 - len(kv))
+        else:
+            kv = list(kv)[:6]
+        k_vecs[eid] = kv
+
+    target_k = [float(complexity_target), 0.0, 0.0, 0.0, 0.0, 0.0]
+    if k_vecs:
+        dims = [1, 2, 4]
+        for di in dims:
+            vals = [float(v[di]) for v in k_vecs.values() if len(v) > di]
+            if vals:
+                target_k[di] = sum(vals) / float(len(vals))
+    k_weights = [0.45, 0.2, 0.2, 0.0, 0.15, 0.0]
+
+    sem_raw = {}
+    clip_raw = {}
+    struct_dist = {}
+    for score, eid in sem_scored:
+        entry = id_to_entry.get(eid)
+        if not entry:
+            continue
+        sem_raw[eid] = float(score)
+        clip_val = 0.0
         if clip_q is not None:
             dval = _dot_safe(clip_q, entry.get("_mc_clip_vec"))
             if dval is not None:
-                score = float(score) + float(dval) * clip_w
-        
-        # Structural Penalty
+                clip_val = float(dval)
+        clip_raw[eid] = clip_val
+        kv = k_vecs.get(eid, [0.0] * 6)
         try:
-            # Ensure complexity is calculated (populates k_vector)
-            _ = lm.ensure_entry_complexity(entry)
-            
-            entry_k = entry.get("k_vector")
-            if not entry_k:
-                # Fallback to scalar if k_vector missing (shouldn't happen with new library_manager)
-                c = float(entry.get("complexity_norm") or 0.0)
-                entry_k = [c, 0.0, 0.0, 0.0, 0.0, 0.0]
-            
-            penalty = exploration_engine.calculate_structural_penalty(
-                entry_k, target_k, weights=k_weights
-            )
-            
-            # Weight the structural penalty relative to semantic score
-            # 0.65 is the legacy factor
-            score -= penalty * 0.65
+            penalty = exploration_engine.calculate_structural_penalty(kv, target_k, weights=k_weights)
         except Exception:
-            pass
-            
-        rescored.append((float(score), str(entry.get("id") or "")))
+            penalty = 0.0
+        struct_dist[eid] = float(penalty)
+
+    sem_norm = _minmax_norm_map(sem_raw, invert=False)
+    clip_norm = _minmax_norm_map(clip_raw, invert=False)
+    struct_norm = _minmax_norm_map(struct_dist, invert=True)
+
+    rescored = []
+    for _score, eid in sem_scored:
+        rerank_score = (
+            sem_norm.get(eid, 0.0) * 0.5
+            + clip_norm.get(eid, 0.0) * 0.2
+            + struct_norm.get(eid, 0.0) * 0.3
+        )
+        rescored.append((float(rerank_score), eid))
     rescored.sort(key=lambda x: x[0], reverse=True)
     out = []
     for _s, eid in rescored:
@@ -569,6 +695,8 @@ class MATCOMPOSER_OT_Generate(bpy.types.Operator):
     _preview_pending_ids = None
     _preview_total = 0
     _preview_done = 0
+    _search_started_at = 0.0
+    _preview_started_at = 0.0
 
     def modal(self, context, event):
         if event.type != 'TIMER':
@@ -597,6 +725,10 @@ class MATCOMPOSER_OT_Generate(bpy.types.Operator):
                 context.window_manager.event_timer_remove(self._timer)
                 return {'FINISHED'}
 
+            if props.debug_mode:
+                elapsed = time.perf_counter() - float(self._search_started_at or time.perf_counter())
+                _debug_timing(True, f"search_to_candidates={elapsed:.3f}s")
+
             if isinstance(result, dict) and result.get("error"):
                 props.is_generating = False
                 context.window_manager.event_timer_remove(self._timer)
@@ -619,10 +751,14 @@ class MATCOMPOSER_OT_Generate(bpy.types.Operator):
             if self._preview_total <= 0:
                 props.is_generating = False
                 context.window_manager.event_timer_remove(self._timer)
+                if props.debug_mode:
+                    total = time.perf_counter() - float(self._search_started_at or time.perf_counter())
+                    _debug_timing(True, f"search_total_no_previews={total:.3f}s")
                 _tag_redraw_all()
                 return {'FINISHED'}
 
             self._phase = "previews"
+            self._preview_started_at = time.perf_counter()
             props.generation_status = f"Loading Previews (0/{self._preview_total})"
             _tag_redraw_all()
             return {'PASS_THROUGH'}
@@ -632,14 +768,27 @@ class MATCOMPOSER_OT_Generate(bpy.types.Operator):
                 props.generation_status = "Slots Ready"
                 props.is_generating = False
                 context.window_manager.event_timer_remove(self._timer)
+                if props.debug_mode:
+                    now = time.perf_counter()
+                    preview_elapsed = now - float(self._preview_started_at or now)
+                    total_elapsed = now - float(self._search_started_at or now)
+                    _debug_timing(
+                        True,
+                        f"preview_total={preview_elapsed:.3f}s count={self._preview_total} end_to_end={total_elapsed:.3f}s",
+                    )
                 _tag_redraw_all()
                 return {'FINISHED'}
 
             entry_id = self._preview_pending_ids.pop(0)
             lm = library_manager.library_manager
             entry = lm.get_entry_by_id(entry_id)
+            preview_t0 = time.perf_counter()
             if entry:
                 lm.ensure_entry_preview_icon_id(entry)
+            if props.debug_mode:
+                preview_elapsed = time.perf_counter() - preview_t0
+                entry_name = str(entry.get("name") or entry_id) if entry else str(entry_id)
+                _debug_timing(True, f"preview role_candidate name='{entry_name}' time={preview_elapsed:.3f}s")
             self._preview_done += 1
             props.generation_status = f"Loading Previews ({self._preview_done}/{self._preview_total})"
             _tag_redraw_all()
@@ -676,6 +825,8 @@ class MATCOMPOSER_OT_Generate(bpy.types.Operator):
         self._preview_pending_ids = []
         self._preview_total = 0
         self._preview_done = 0
+        self._search_started_at = time.perf_counter()
+        self._preview_started_at = 0.0
 
         props.is_generating = True
         props.generation_status = "Searching Slots..."
@@ -683,7 +834,14 @@ class MATCOMPOSER_OT_Generate(bpy.types.Operator):
 
         lm = library_manager.library_manager
         if not lm.index_data:
+            scan_t0 = time.perf_counter()
             lm.scan_asset_libraries()
+            _debug_timing(
+                props.debug_mode,
+                f"scan_asset_libraries={time.perf_counter() - scan_t0:.3f}s entries={len(lm.index_data)}",
+            )
+        else:
+            _debug_timing(props.debug_mode, f"index_ready entries={len(lm.index_data)}")
 
         complexity_target = float(getattr(props, "search_complexity", 0.4))
 
@@ -702,21 +860,40 @@ class MATCOMPOSER_OT_Generate(bpy.types.Operator):
             allowed = _allowed_asset_types_for_role(props, role)
             slot_payload.append((role, allowed, dict(s)))
 
-        self._thread = threading.Thread(target=self.run_search, args=(prompt, complexity_target, slot_payload))
+        _debug_timing(props.debug_mode, f"search_start slots={len(slot_payload)} complexity={complexity_target:.3f}")
+
+        self._thread = threading.Thread(
+            target=self.run_search,
+            args=(prompt, complexity_target, slot_payload, bool(props.debug_mode)),
+        )
         self._thread.start()
 
         self._timer = context.window_manager.event_timer_add(0.05, window=context.window)
         context.window_manager.modal_handler_add(self)
         return {'RUNNING_MODAL'}
 
-    def run_search(self, prompt, complexity_target, slot_payload):
+    def run_search(self, prompt, complexity_target, slot_payload, debug_enabled=False):
         try:
             lm = library_manager.library_manager
             out = {}
+            worker_t0 = time.perf_counter()
             for role, allowed, slot_dict in slot_payload:
+                role_t0 = time.perf_counter()
                 rep = _slot_query_rep(prompt, slot_dict)
+                rep_t1 = time.perf_counter()
                 ids = _rank_entries_for_rep(lm, rep, allowed, complexity_target, top_k=12)
+                rank_t1 = time.perf_counter()
+                _debug_timing(
+                    debug_enabled,
+                    "role='{0}' rep={1:.3f}s rank={2:.3f}s raw_candidates={3}".format(
+                        role,
+                        rep_t1 - role_t0,
+                        rank_t1 - rep_t1,
+                        len(ids),
+                    ),
+                )
                 out[str(role)] = {"ids": ids, "rep_json": semantic_init.representation_to_json_str(rep)}
+            _debug_timing(debug_enabled, f"worker_total={time.perf_counter() - worker_t0:.3f}s")
             search_queue.put(out)
         except Exception as e:
             search_queue.put({"error": str(e)})
@@ -741,20 +918,29 @@ class MATCOMPOSER_OT_Generate(bpy.types.Operator):
             "Detail": "candidate_pick_detail",
         }
 
+        handle_t0 = time.perf_counter()
         for role, payload in result.items():
+            if str(role).startswith("_"):
+                continue
             if not isinstance(payload, dict):
                 continue
             ids = payload.get("ids") or []
             rep_json = str(payload.get("rep_json") or "")
             rep = semantic_init.json_str_to_representation(rep_json) if rep_json else None
             if rep and isinstance(ids, list):
+                finalize_t0 = time.perf_counter()
                 ids = _finalize_ids_for_rep_with_complexity(lm, rep, ids, complexity_target)[:4]
+                _debug_timing(
+                    props.debug_mode,
+                    f"role='{role}' finalize_complexity={time.perf_counter() - finalize_t0:.3f}s final_candidates={len(ids)}",
+                )
             else:
                 ids = [str(x) for x in ids if str(x)][:4] if isinstance(ids, list) else []
             _set_candidates_for_role(props, str(role), ids)
 
 
         props.generation_status = "Slots Ready"
+        _debug_timing(props.debug_mode, f"handle_result={time.perf_counter() - handle_t0:.3f}s")
         _tag_redraw_all()
 
 
@@ -825,12 +1011,14 @@ class MATCOMPOSER_OT_AssembleSlots(bpy.types.Operator):
             if not entry:
                 continue
             relation = "base" if role == "Base" else "overlay"
+            slot_to_apply = dict(slot)
+            slot_to_apply["mask"] = _get_mask_selection_for_role(props, role)
             ok = composition_engine.apply_library_entry_to_object_material(
                 context,
                 entry,
                 slot_role=role,
                 relation=relation,
-                slot_spec=slot,
+                slot_spec=slot_to_apply,
                 use_external_mapping=bool(getattr(props, "force_external_mapping", False)),
             )
             applied = applied or bool(ok)
@@ -856,17 +1044,17 @@ class MATCOMPOSER_OT_SelectSlotCandidate(bpy.types.Operator):
         entry_id = str(properties.entry_id or "")
         if not entry_id:
             return "Select this candidate"
-            
+
         try:
             lm = library_manager.library_manager
             entry = lm.get_entry_by_id(entry_id)
             if not entry:
                 return "Unknown entry"
-                
+
             lines = []
             name = str(entry.get("name") or "Material")
             lines.append(f"Name: {name}")
-            
+
             # Add structural info
             vec = entry.get("k_vector")
             if vec and len(vec) >= 6:
@@ -877,7 +1065,7 @@ class MATCOMPOSER_OT_SelectSlotCandidate(bpy.types.Operator):
                 lines.append(f"  Dominance: {vec[3]:.2f}")
                 lines.append(f"  Procedural: {vec[4]:.2f}")
                 lines.append(f"  MathRatio: {vec[5]:.2f}")
-                
+
             # Add tags
             tags = entry.get("tags")
             if tags and isinstance(tags, (list, tuple)):
@@ -885,7 +1073,7 @@ class MATCOMPOSER_OT_SelectSlotCandidate(bpy.types.Operator):
                 if len(tags) > 5:
                     t_str += "..."
                 lines.append(f"Tags: {t_str}")
-                
+
             return "\n".join(lines)
         except Exception:
             return "Select this candidate"
@@ -896,6 +1084,10 @@ class MATCOMPOSER_OT_SelectSlotCandidate(bpy.types.Operator):
         entry_id = str(self.entry_id or "")
         if not entry_id:
             return {'CANCELLED'}
+        try:
+            _snapshot_search_state(props)
+        except Exception:
+            pass
 
         prev_id, curr_id = _get_selection_for_role(props, role)
         _set_selection_for_role(props, role, curr_id, entry_id)
@@ -905,6 +1097,84 @@ class MATCOMPOSER_OT_SelectSlotCandidate(bpy.types.Operator):
         props.curr_selected_entry_id = entry_id
         props.generation_status = "Selected"
         return {'FINISHED'}
+
+
+class MATCOMPOSER_OT_SelectMask(bpy.types.Operator):
+    bl_idname = "matcomposer.select_mask"
+    bl_label = "Select Mask"
+    bl_description = "Select the mask override for a slot"
+
+    role: bpy.props.StringProperty()
+    mask_key: bpy.props.StringProperty()
+
+    def execute(self, context):
+        props = context.scene.mat_composer
+        role = str(self.role or "")
+        if not role:
+            return {'CANCELLED'}
+        try:
+            _snapshot_search_state(props)
+        except Exception:
+            pass
+        mask_key = str(self.mask_key or "").strip()
+        _set_mask_selection_for_role(props, role, mask_key)
+        props.generation_status = "Mask Selected"
+        _tag_redraw_all()
+        return {'FINISHED'}
+
+
+class MATCOMPOSER_OT_OpenMaskPicker(bpy.types.Operator):
+    bl_idname = "matcomposer.open_mask_picker"
+    bl_label = "Choose Mask"
+    bl_description = "Open the mask picker"
+
+    role: bpy.props.StringProperty()
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_popup(self, width=520)
+
+    def draw(self, context):
+        from . import ui as ui_mod
+
+        layout = self.layout
+        props = context.scene.mat_composer
+        role = str(self.role or "")
+        current = ui_mod._get_mask_selection_for_role(props, role, slot=None)
+        items = ui_mod._mask_items_for_ui()
+        flow = layout.grid_flow(columns=3, even_columns=True, even_rows=True, align=True)
+        for item in items:
+            col = flow.column(align=True)
+            icon_id = int(item.get("icon_id") or 0)
+            if icon_id > 0:
+                col.template_icon(icon_value=icon_id, scale=6.0)
+            else:
+                placeholder = col.column(align=True)
+                placeholder.scale_y = 4.0
+                placeholder.label(text="", icon='TEXTURE')
+            label = str(item.get("label") or "")
+            button_text = label if len(label) <= 16 else (label[:15] + "…")
+            op = col.operator(
+                "matcomposer.select_mask",
+                text=button_text,
+                depress=(str(item.get("key") or "") == current),
+            )
+            op.role = role
+            op.mask_key = str(item.get("key") or "")
+            if bool(getattr(props, "debug_mode", False)):
+                dbg = ui_mod._mask_debug_info(item.get("key") or "")
+                path = str(dbg.get("path") or "")
+                if path:
+                    col.label(text=os.path.basename(path))
+                col.label(text=f"I:{int(dbg.get('image_icon_id') or 0)}")
+                err = str(dbg.get("error") or "").strip()
+                if err:
+                    col.label(text="ERR", icon='ERROR')
+
+    def execute(self, context):
+        role = str(self.role or "").strip()
+        if not role:
+            return {'CANCELLED'}
+        return context.window_manager.invoke_popup(self, width=520)
 
 
 class MATCOMPOSER_OT_LoadCandidatePreviews(bpy.types.Operator):
@@ -1036,7 +1306,7 @@ class MATCOMPOSER_OT_SemanticInit(bpy.types.Operator):
             model = "qwen-vl-plus"
         else:
             model = "qwen-plus"
-        
+
         print(f"[MatComposer] Auto-switching model to: {model}")
 
         if not api_key:
@@ -1088,6 +1358,7 @@ class MATCOMPOSER_OT_SemanticInit(bpy.types.Operator):
         result["slots"] = (slots or [])[:slot_count]
 
         props.semantic_plan_json = dict_to_str(result)
+        _sync_mask_defaults_from_plan(props, result)
 
         mat = get_active_material(context)
         k = semantic_init.build_k_topology_from_node_tree(mat.node_tree if mat and mat.use_nodes else None)
@@ -1149,22 +1420,26 @@ class MATCOMPOSER_OT_ExploreAuto(bpy.types.Operator):
         if not slot:
             self.report({'ERROR'}, "No slot found. Run Semantic Init.")
             return {'CANCELLED'}
+        try:
+            _snapshot_search_state(props)
+        except Exception:
+            pass
 
         # Update global role property for consistency/UI feedback
         props.apply_slot_role = role
 
         prev_id, curr_id = _get_selection_for_role(props, role)
-        
+
         # Determine Exploration Mode
         # "Alternating" Logic: Local -> Directional -> Local -> ...
         last_mode = getattr(props, "last_exploration_mode", "LOCAL")
         mode = "LOCAL"
-        
+
         if prev_id and curr_id and last_mode == "LOCAL":
             # If we have a vector (prev->curr) and just finished a Local step (selection),
             # we switch to Directional.
             mode = "DIRECTIONAL"
-            
+
         # Verify Directional viability
         prev_entry = None
         curr_entry = None
@@ -1178,18 +1453,18 @@ class MATCOMPOSER_OT_ExploreAuto(bpy.types.Operator):
             props.last_exploration_mode = "LOCAL"
             allowed = _allowed_asset_types_for_role(props, role)
             complexity_target = float(getattr(props, "search_complexity", 0.4))
-            
+
             # Use Current Selection as query center if available
             rep = None
             if curr_id:
                 curr_entry = lm.get_entry_by_id(curr_id)
                 if curr_entry:
                     rep = exploration_engine.representation_from_entry(curr_entry)
-            
+
             # Fallback to Text Prompt
             if not rep:
                 rep = _slot_query_rep(props.text_prompt, slot)
-                
+
             ids = _rank_entries_for_rep(lm, rep, allowed, complexity_target, top_k=18)
             ids = _finalize_ids_for_rep_with_complexity(lm, rep, ids, complexity_target)[:18]
             _set_candidates_for_role(props, role, ids)
@@ -1199,7 +1474,7 @@ class MATCOMPOSER_OT_ExploreAuto(bpy.types.Operator):
         # Directional Mode
         props.last_exploration_mode = "DIRECTIONAL"
         expl_mode = getattr(props, "exploration_mode", "JOINT")
-        
+
         prompt_rep = semantic_init.build_representation_from_semantic_json(
             props.text_prompt,
             plan if isinstance(plan, dict) else {"tags": [], "slot_count": 1, "slots": []},
@@ -1232,7 +1507,7 @@ class MATCOMPOSER_OT_ExploreAuto(bpy.types.Operator):
             locked.append("Detail")
 
         allowed = _allowed_asset_types_for_role(props, role)
-        
+
         # Base Candidate Retrieval
         candidates = []
         if expl_mode == 'LOCK_SEMANTICS':
@@ -1268,7 +1543,7 @@ class MATCOMPOSER_OT_ExploreAuto(bpy.types.Operator):
         curr_clip = curr_entry.get("_mc_clip_vec") if isinstance(curr_entry, dict) else None
         prev_gnn = prev_entry.get("_mc_gnn_vec") if isinstance(prev_entry, dict) else None
         curr_gnn = curr_entry.get("_mc_gnn_vec") if isinstance(curr_entry, dict) else None
-        
+
         # Pre-fetch structural vectors
         try:
              lm.ensure_entry_complexity(prev_entry)
@@ -1278,80 +1553,94 @@ class MATCOMPOSER_OT_ExploreAuto(bpy.types.Operator):
         prev_k = prev_entry.get("k_vector")
         curr_k = curr_entry.get("k_vector")
 
-        rescored = []
+        base_raw = {}
+        clip_raw = {}
+        gnn_raw = {}
+        struct_raw = {}
+        k_dist_raw = {}
+        g_dist_raw = {}
         for eid in shortlist:
             e = lm.get_entry_by_id(eid)
             if not e:
                 continue
-            
-            # Base Semantic Score
             base_score = 0.0
             for c in candidates:
                 if str(c.entry_id) == eid:
                     base_score = float(c.score)
                     break
-            
-            # CLIP Directional Score
             clip_score = 0.0
             try:
                 clip_score = _clip_directional_score(prev_clip, curr_clip, e.get("_mc_clip_vec"))
             except Exception:
                 pass
-
-            # GNN Structural Directional Score
             gnn_score = 0.0
             try:
                 gnn_score = _gnn_directional_score(prev_gnn, curr_gnn, e.get("_mc_gnn_vec"))
             except Exception:
                 pass
-                
-            # Structural Directional Score
             struct_score = 0.0
             try:
                 _ = lm.ensure_entry_complexity(e)
                 struct_score = _structural_directional_score(prev_k, curr_k, e.get("k_vector"))
             except Exception:
                 pass
-                
-            final_score = base_score
-            
+
+            k_dist = 0.0
+            ek = e.get("k_vector")
+            if curr_k and ek:
+                k_dist = _euclidean_safe(curr_k, ek) or 0.0
+            g_dist = 0.0
+            try:
+                dval = _cosine_distance_safe(curr_gnn, e.get("_mc_gnn_vec"))
+                if dval is not None:
+                    g_dist = float(dval)
+            except Exception:
+                pass
+
+            base_raw[eid] = float(base_score)
+            clip_raw[eid] = float(clip_score)
+            gnn_raw[eid] = float(gnn_score)
+            struct_raw[eid] = float(struct_score)
+            k_dist_raw[eid] = float(k_dist)
+            g_dist_raw[eid] = float(g_dist)
+
+        base_norm = _minmax_norm_map(base_raw, invert=False)
+        clip_norm = _minmax_norm_map(clip_raw, invert=False)
+        gnn_norm = _minmax_norm_map(gnn_raw, invert=False)
+        struct_norm = _minmax_norm_map(struct_raw, invert=False)
+        k_compat_norm = _minmax_norm_map(k_dist_raw, invert=True)
+        g_compat_norm = _minmax_norm_map(g_dist_raw, invert=True)
+
+        rescored = []
+        for eid in shortlist:
+            if eid not in base_norm:
+                continue
             if expl_mode == 'LOCK_SEMANTICS':
-                # Lock Semantics (Stay in Style), Explore Structure
-                # base_score is Local Semantic Similarity (high is good)
-                # We want to boost entries that follow structural direction
-                final_score = base_score + struct_score * 1.2 + gnn_score * 1.2
-                
+                final_score = (
+                    base_norm.get(eid, 0.0) * 0.45
+                    + struct_norm.get(eid, 0.0) * 0.30
+                    + gnn_norm.get(eid, 0.0) * 0.25
+                )
             elif expl_mode == 'LOCK_STRUCTURE':
-                # Lock Structure (Stay in Structure), Explore Semantics
-                # base_score is Semantic Directional Score (high is good)
-                # We want to PENALIZE structural distance from Curr (Keep structure)
-                
-                # Calculate distance to Curr Structure
-                k_dist = 0.0
-                ek = e.get("k_vector")
-                if curr_k and ek:
-                    k_dist = _euclidean_safe(curr_k, ek) or 0.0
-                g_dist = 0.0
-                try:
-                    dval = _cosine_distance_safe(curr_gnn, e.get("_mc_gnn_vec"))
-                    if dval is not None:
-                        g_dist = float(dval)
-                except Exception:
-                    pass
-                final_score = base_score - k_dist * 0.55 - g_dist * 0.55
-                
-            else: # JOINT
-                # Explore both
-                # base_score (Semantic Dir) + CLIP Dir + K-Dir + GNN-Dir
-                final_score = base_score + clip_score * 0.25 + struct_score * 0.45 + gnn_score * 0.45
-                
-            rescored.append((final_score, eid))
-            
+                final_score = (
+                    base_norm.get(eid, 0.0) * 0.60
+                    + k_compat_norm.get(eid, 0.0) * 0.25
+                    + g_compat_norm.get(eid, 0.0) * 0.15
+                )
+            else:
+                final_score = (
+                    base_norm.get(eid, 0.0) * 0.40
+                    + clip_norm.get(eid, 0.0) * 0.20
+                    + struct_norm.get(eid, 0.0) * 0.20
+                    + gnn_norm.get(eid, 0.0) * 0.20
+                )
+            rescored.append((float(final_score), eid))
+
         rescored.sort(key=lambda x: x[0], reverse=True)
         top_ids = [eid for _, eid in rescored[:18]]
-        
+
         _set_candidates_for_role(props, role, top_ids)
-        
+
         status_map = {
             'JOINT': 'Joint',
             'LOCK_SEMANTICS': 'Lock Sem',
@@ -1535,41 +1824,42 @@ class MATCOMPOSER_OT_ScanLibrary(bpy.types.Operator):
     bl_idname = "matcomposer.scan_library"
     bl_label = "Scan Asset Libraries"
     bl_description = "Scan all registered Blender Asset Libraries for materials"
-    
+
     def execute(self, context):
         lm = library_manager.library_manager
         count = lm.scan_asset_libraries()
-        
+
         if count > 0:
             self.report({'INFO'}, f"Scanned {count} materials from MyMaterial.")
         else:
             self.report({'WARNING'}, "No materials found in MyMaterial.")
-            
+
         return {'FINISHED'}
+
 
 class MATCOMPOSER_OT_GenerateVariants(bpy.types.Operator):
     bl_idname = "matcomposer.generate_variants"
     bl_label = "Generate Variants"
     bl_description = "Generate 4 variations of the current material"
-    
+
     def execute(self, context):
         mat = get_active_material(context)
         if not mat or not mat.use_nodes:
             self.report({'ERROR'}, "No active material found")
             return {'CANCELLED'}
-            
+
         props = context.scene.mat_composer
-        
+
         # 1. Extract current parameters
         base_params = graph_builder.get_node_parameters(mat.node_tree)
-        
+
         # 2. Generate 4 variants using noise
         # We store them in the props as JSON strings
         props.variant_1_params = dict_to_str(math_utils.apply_noise(base_params, intensity=0.05))
         props.variant_2_params = dict_to_str(math_utils.apply_noise(base_params, intensity=0.10))
         props.variant_3_params = dict_to_str(math_utils.apply_noise(base_params, intensity=0.15))
         props.variant_4_params = dict_to_str(math_utils.apply_noise(base_params, intensity=0.20))
-        
+
         self.report({'INFO'}, "Variants Generated")
         return {'FINISHED'}
 
@@ -1577,70 +1867,70 @@ class MATCOMPOSER_OT_ApplyVariant(bpy.types.Operator):
     bl_idname = "matcomposer.apply_variant"
     bl_label = "Apply Variant"
     bl_description = "Apply this variant to the material"
-    
+
     variant_index: bpy.props.IntProperty()
-    
+
     def execute(self, context):
         mat = get_active_material(context)
         if not mat:
             return {'CANCELLED'}
-            
+
         props = context.scene.mat_composer
-        
+
         # Get params from storage
         param_str = ""
         if self.variant_index == 1: param_str = props.variant_1_params
         elif self.variant_index == 2: param_str = props.variant_2_params
         elif self.variant_index == 3: param_str = props.variant_3_params
         elif self.variant_index == 4: param_str = props.variant_4_params
-        
+
         if not param_str:
             return {'CANCELLED'}
-            
+
         params = str_to_dict(param_str)
-        
+
         # Apply to graph
         graph_builder.apply_parameters(mat.node_tree, params)
-        
+
         # Save to history
         save_to_history(context, mat, params)
-        
+
         return {'FINISHED'}
 
 class MATCOMPOSER_OT_Evolve(bpy.types.Operator):
     bl_idname = "matcomposer.evolve"
     bl_label = "Evolve / Extrapolate"
     bl_description = "Evolve material based on selection history"
-    
+
     def execute(self, context):
         props = context.scene.mat_composer
         history = props.history
         curr_idx = props.current_history_index
-        
+
         # Need at least 2 items: Current and Previous
         if curr_idx < 1 or len(history) < 2:
             self.report({'WARNING'}, "Need at least 2 history steps to evolve")
             return {'CANCELLED'}
-            
+
         # Get Previous and Current
         prev_item = history[curr_idx - 1]
         curr_item = history[curr_idx]
-        
+
         prev_params = str_to_dict(prev_item.params_json)
         curr_params = str_to_dict(curr_item.params_json)
-        
+
         # Calculate Delta (Current - Previous)
         delta = math_utils.calculate_difference(prev_params, curr_params)
-        
+
         # Extrapolate (Current + Delta * 1.5)
         new_params = math_utils.extrapolate(curr_params, delta, factor=1.5)
-        
+
         # Apply
         mat = get_active_material(context)
         if mat:
             graph_builder.apply_parameters(mat.node_tree, new_params)
             save_to_history(context, mat, new_params)
-            
+
         self.report({'INFO'}, "Material Evolved")
         return {'FINISHED'}
 
@@ -1649,6 +1939,8 @@ classes = [
     MATCOMPOSER_OT_RevertSearchState,
     MATCOMPOSER_OT_AssembleSlots,
     MATCOMPOSER_OT_SelectSlotCandidate,
+    MATCOMPOSER_OT_SelectMask,
+    MATCOMPOSER_OT_OpenMaskPicker,
     MATCOMPOSER_OT_LoadCandidatePreviews,
     MATCOMPOSER_OT_ScanLibrary,
     MATCOMPOSER_OT_GenerateVariants,

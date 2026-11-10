@@ -1,6 +1,8 @@
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (C) 2026 MatComposer authors
+
 import bpy
 import os
-import json
 
 
 HOOK_OUTPUT_TO_PRINCIPLED_INPUT = {
@@ -13,7 +15,6 @@ HOOK_OUTPUT_TO_PRINCIPLED_INPUT = {
 }
 
 _MASK_BLENDS_CACHE = None
-_MASK_LLM_CACHE = {}
 
 
 def _repo_root_dir():
@@ -73,95 +74,10 @@ def _append_first_node_group(full_path: str, prefer_name: str = ""):
         return None
 
 
-def _pick_mask_key_with_llm(hints, available_keys, context=None):
-    if not available_keys:
-        return ""
-    scene = getattr(context, "scene", None) if context else None
-    if scene is None:
-        scene = getattr(bpy.context, "scene", None)
-    props = getattr(scene, "mat_composer", None) if scene else None
-    api_key = str(getattr(props, "api_key", "") or "").strip() if props else ""
-    model = str(getattr(props, "model_selection", "") or "").strip() if props else ""
-    if not api_key:
-        return ""
-    if not model:
-        model = "qwen-plus"
-
-    tokens = []
-    for h in hints or []:
-        if h is None:
-            continue
-        if isinstance(h, (list, tuple, set)):
-            for x in h:
-                s = str(x or "").strip()
-                if s:
-                    tokens.append(s)
-        else:
-            s = str(h or "").strip()
-            if s:
-                tokens.append(s)
-    if not tokens:
-        return ""
-
-    cache_key = (
-        "|".join(sorted([str(x).lower() for x in tokens])),
-        "|".join(sorted([str(x) for x in available_keys])),
-    )
-    cached = _MASK_LLM_CACHE.get(cache_key)
-    if cached in available_keys:
-        return cached
-
-    try:
-        try:
-            from ..llm_handler import LLMClient
-        except Exception:
-            from llm_handler import LLMClient
-    except Exception:
-        return ""
-
-    client = LLMClient(api_key, model=model)
-    sys_prompt = (
-        "You select one mask key for Blender material overlay.\n"
-        "Return ONLY strict JSON: {\"mask\": \"one_of_available\"}.\n"
-        "No markdown. No extra keys."
-    )
-    user_prompt = (
-        "Available mask keys:\n"
-        + json.dumps(sorted(list(available_keys)), ensure_ascii=False)
-        + "\nHints:\n"
-        + json.dumps(tokens, ensure_ascii=False)
-        + "\nSelect the single best mask."
-    )
-    data = {
-        "model": model,
-        "messages": client._build_messages(sys_prompt, user_prompt),
-        "temperature": 0.0,
-    }
-    content, _result = client._send_request(data, debug=False, debug_label="Mask Select")
-    if not content:
-        return ""
-    raw = str(content).strip()
-    if raw.startswith("```json"):
-        raw = raw[7:]
-    elif raw.startswith("```"):
-        raw = raw[3:]
-    if raw.endswith("```"):
-        raw = raw[:-3]
-    try:
-        parsed = json.loads(raw)
-    except Exception:
-        return ""
-    picked = str(parsed.get("mask") or "").strip()
-    if picked in available_keys:
-        _MASK_LLM_CACHE[cache_key] = picked
-        return picked
-    return ""
-
-
 def _pick_mask_key(hints, available_keys, context=None):
     if not available_keys:
         return ""
-    toks = []
+    normalized_available = {str(k).strip().lower(): k for k in available_keys if str(k).strip()}
     if hints:
         for h in hints:
             if h is None:
@@ -170,54 +86,28 @@ def _pick_mask_key(hints, available_keys, context=None):
                 for x in h:
                     s = str(x or "").strip().lower()
                     if s:
-                        toks.append(s)
+                        if s in normalized_available:
+                            return normalized_available[s]
+                        s2 = s.replace("-", "_").replace(" ", "_")
+                        if s2 in normalized_available:
+                            return normalized_available[s2]
+                        for nk, raw in normalized_available.items():
+                            if nk and (nk in s or nk in s2):
+                                return raw
                 continue
             s = str(h or "").strip().lower()
             if s:
-                toks.append(s)
-    text = " ".join(toks)
-    words = set()
-    for t in toks:
-        for w in t.replace("/", " ").replace(":", " ").replace("_", " ").split():
-            if w:
-                words.add(w)
-    if text:
-        words.add(text)
-
-    key_to_keywords = {
-        "edge_mask": {"edge", "wear", "scratch", "scratched", "rust", "rusty", "chip", "chipped", "curvature"},
-        "peeling_mask": {"peel", "peeling", "paint", "coating", "flake", "flaking", "chip", "chipped"},
-        "splatter_mask": {"splatter", "spray", "splash", "droplet", "drops", "mud", "muddy"},
-        "cell_mask": {"cell", "voronoi", "organic", "pattern"},
-        "normal_mask": {"normal"},
-        "ao_mask": {"ao", "ambient", "occlusion", "cavity", "dirt", "dust", "grime", "moss", "snow", "wet", "water", "stain", "stained"},
-        "generated_mask": {"generated", "random", "noise"},
-    }
-
-    scores = {k: 0 for k in available_keys}
-    for k, kws in key_to_keywords.items():
-        if k not in scores:
-            continue
-        for w in words:
-            if not w:
-                continue
-            if w in kws:
-                scores[k] += 3
-            else:
-                for kw in kws:
-                    if kw in w:
-                        scores[k] += 1
-
-    best = max(scores.items(), key=lambda kv: (kv[1], kv[0])) if scores else ("", 0)
-    if best[1] <= 0 or best[0] == "ao_mask":
-        llm_pick = _pick_mask_key_with_llm(toks, available_keys, context=context)
-        if llm_pick:
-            return llm_pick
-    if best[1] <= 0:
-        if "ao_mask" in available_keys:
-            return "ao_mask"
-        return sorted(list(available_keys))[0]
-    return best[0]
+                if s in normalized_available:
+                    return normalized_available[s]
+                s2 = s.replace("-", "_").replace(" ", "_")
+                if s2 in normalized_available:
+                    return normalized_available[s2]
+                for nk, raw in normalized_available.items():
+                    if nk and (nk in s or nk in s2):
+                        return raw
+    if "ao_mask" in normalized_available:
+        return normalized_available["ao_mask"]
+    return sorted(list(available_keys))[0]
 
 
 def _mask_fac_socket(tree, mapping, mask_hints, location=(-350, -520), context=None):
@@ -455,14 +345,14 @@ def _append_material(full_path: str, mat_name: str):
 def _copy_node_attributes(src, dst):
     props_to_copy = [
         "operation", "blend_type", "data_type", "clamp_factor", "clamp_result", "use_clamp",
-        "mode", "interpolation", "projection", "extension", "distribution", 
-        "color_mode", "distance_metric", "falloff", "gradient_type", 
+        "mode", "interpolation", "projection", "extension", "distribution",
+        "color_mode", "distance_metric", "falloff", "gradient_type",
         "musgrave_type", "noise_dimensions", "noise_type", "offset", "offset_type",
         "rotation_mode", "space", "texture_mapping", "tolerance", "vector_type",
         "wave_profile", "wave_type", "axis", "channel", "component",
         "factor_mode", "feature", "turbulence_depth"
     ]
-    
+
     for p in props_to_copy:
         if hasattr(src, p) and hasattr(dst, p):
             try:
@@ -477,15 +367,15 @@ def _copy_node_attributes(src, dst):
             dst_cr.color_mode = src_cr.color_mode
             dst_cr.hue_interpolation = src_cr.hue_interpolation
             dst_cr.interpolation = src_cr.interpolation
-            
+
             src_elems = src_cr.elements
             dst_elems = dst_cr.elements
-            
+
             while len(dst_elems) > len(src_elems):
                 dst_elems.remove(dst_elems[-1])
             while len(dst_elems) < len(src_elems):
                 dst_elems.new(1.0)
-                
+
             for i, src_el in enumerate(src_elems):
                 dst_el = dst_elems[i]
                 dst_el.position = src_el.position
@@ -601,7 +491,7 @@ def _material_to_node_group(source_material: bpy.types.Material, group_name: str
 
     group_in = ng.nodes.new(type="NodeGroupInput")
     group_out = ng.nodes.new(type="NodeGroupOutput")
-    
+
     xs = []
     ys = []
     for n in ng.nodes:
@@ -947,6 +837,9 @@ def apply_library_entry_to_object_material(
     if slot_role:
         mask_hints.append(str(slot_role))
     if isinstance(slot_spec, dict):
+        mask_pref = str(slot_spec.get("mask") or "").strip()
+        if mask_pref:
+            mask_hints.append(mask_pref)
         concept = slot_spec.get("concept") or slot_spec.get("label") or ""
         if concept:
             mask_hints.append(str(concept))

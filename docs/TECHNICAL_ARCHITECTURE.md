@@ -15,9 +15,9 @@ This separation allows the system to perform "Directional Exploration"—navigat
 The Semantic Space is a high-dimensional continuous vector space where materials are positioned based on their textual descriptions and tags.
 
 ### Definition
--   **Representation**: A vector $v \in \mathbb{R}^d$ (default $d=128$).
+-   **Representation**: A vector $v \in \mathbb{R}^d$ (default $d=64$).
 -   **Basis**: The space is constructed using a **Deterministic Stable Unit Hash** embedding strategy, rather than a heavy pre-trained Transformer model. This ensures:
-    -   **Zero-Latency**: No inference required for vectorization.
+    -   **No model inference**: No inference required for vectorization.
     -   **Stability**: The same tag always yields the exact same vector across sessions.
     -   **Lightweight**: Runs purely on CPU with minimal memory footprint.
 

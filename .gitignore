@@ -2,3 +2,28 @@ material_cache/
 __pycache__/
 *.pyc
 .vscode/
+
+# Local credentials and environment files
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.venv/
+venv/
+
+# Blender autosaves and editor backups
+*.blend[0-9]*
+*.blend@
+*.blend.*.tmp
+*~
+*.bak
+
+# Build outputs and local tooling
+dist/
+build/
+*.egg-info/
+.ruff_cache/
+.pytest_cache/
+.DS_Store
+Thumbs.db

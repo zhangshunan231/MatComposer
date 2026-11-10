@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (C) 2026 MatComposer authors
+
 import os
 import json
 import base64
@@ -7,6 +10,7 @@ import tempfile
 import sys
 import argparse
 import math
+import shutil
 
 try:
     import bpy
@@ -14,7 +18,7 @@ except Exception:
     bpy = None
 
 # ================= CONFIGURATION =================
-# PLEASE PASTE YOUR ALIBABA CLOUD QWEN API KEY HERE
+# Read the API key from the environment; never put credentials in source files.
 API_KEY = os.environ.get("DASHSCOPE_API_KEY", "")
 
 # Model to use
@@ -49,6 +53,7 @@ CATEGORY_TAGS = {
     "glass",
     "brick",
     "tile",
+    "lava",
 }
 
 STYLE_TAGS = {
@@ -118,7 +123,12 @@ def _extract_script_argv(argv):
     try:
         idx = argv.index("--")
     except ValueError:
-        return []
+        exe = os.path.basename(str(argv[0] if argv else "")).lower()
+        if exe.startswith("blender"):
+            # Running as: blender ... -P script.py  (without `--`)
+            # Keep script args empty; otherwise Blender's own flags break argparse.
+            return []
+        return list(argv[1:])
     return argv[idx + 1 :]
 
 def _repo_root():
@@ -137,12 +147,66 @@ def _safe_filename(name):
         s = "material"
     return s[:180]
 
+
+def _normalize_catalog_uuid(value):
+    s = str(value or "").strip()
+    if not s:
+        return ""
+    if s.startswith("AssetCatalogID(") and s.endswith(")"):
+        s = s[len("AssetCatalogID(") : -1].strip()
+    if s.startswith("UUID(") and s.endswith(")"):
+        s = s[len("UUID(") : -1].strip()
+    return s.strip().strip("{}").strip().strip("'\"").lower()
+
+
+def _catalog_matches(target_catalog, actual_catalog):
+    target = str(target_catalog or "").strip().strip("/").lower()
+    actual = str(actual_catalog or "").strip().strip("/").lower()
+    if not target:
+        return True
+    candidates = [actual]
+    if actual.startswith("mymaterial") and not actual.startswith("mymaterials"):
+        candidates.append("mymaterials" + actual[len("mymaterial") :])
+    elif actual.startswith("mymaterials"):
+        candidates.append("mymaterial" + actual[len("mymaterials") :])
+    for c in candidates:
+        if c == target or c.startswith(target + "/"):
+            return True
+    return False
+
+
+def _has_asset_tags(asset_data):
+    if not asset_data:
+        return False
+    try:
+        tags = getattr(asset_data, "tags", None)
+    except Exception:
+        return False
+
+
+def _preview_output_path(previews_dir, material_name):
+    return os.path.join(previews_dir, _safe_filename(material_name) + ".png")
+    if tags is None:
+        return False
+    try:
+        for t in tags:
+            if str(getattr(t, "name", "") or "").strip():
+                return True
+    except Exception:
+        pass
+    try:
+        return len(tags) > 0
+    except Exception:
+        return False
+
 def _parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--preview-only", action="store_true", help="Only render previews; skip tag generation")
     ap.add_argument("--cache-dir", default="", help="Cache directory for previews (default: <repo>/material_cache)")
-    ap.add_argument("--target-catalog", default=None, help="Only process this catalog path (empty = all)")
-    ap.add_argument("--target-material", default=None, help="Only process this exact material name")
+    ap.add_argument("--preview-subdir", default="MyMaterials", help="Preview subdirectory under <cache-dir>/previews")
+    ap.add_argument("--skip-existing-preview", action="store_true", help="In preview-only mode, render only missing preview files")
+    ap.add_argument("--target-catalog", nargs="?", const="", default=None, help="Only process this catalog path (omit value for all)")
+    ap.add_argument("--target-material", nargs="?", const="", default=None, help="Only process this exact material name")
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--skip-existing", dest="skip_existing", action="store_const", const=True, default=None, help="Skip already-tagged materials")
     g.add_argument("--no-skip-existing", dest="skip_existing", action="store_const", const=False, help="Do not skip already-tagged materials")
@@ -155,7 +219,7 @@ def load_catalog_map():
     """
     base_dir = os.path.dirname(bpy.data.filepath)
     cats_path = os.path.join(base_dir, "blender_assets.cats.txt")
-    
+
     catalog_map = {}
     if not os.path.exists(cats_path):
         # Try looking one level up just in case
@@ -174,12 +238,13 @@ def load_catalog_map():
                     continue
                 parts = line.split(":")
                 if len(parts) >= 3:
-                    uuid = parts[0]
+                    uuid = _normalize_catalog_uuid(parts[0])
                     path = parts[1]
-                    catalog_map[uuid] = path
+                    if uuid:
+                        catalog_map[uuid] = path
     except Exception as e:
         print(f"Error reading catalog file: {e}")
-        
+
     return catalog_map
 
 def normalize_tag_prefix(tag):
@@ -225,7 +290,7 @@ def setup_preview_scene():
     bpy.ops.mesh.primitive_uv_sphere_add(radius=1.0, location=(0, 0, 0))
     obj = bpy.context.active_object
     bpy.ops.object.shade_smooth()
-    
+
     # Add a camera
     bpy.ops.object.camera_add(location=(0, -3.5, 0), rotation=(1.5708, 0, 0)) # 90 degrees X
     cam = bpy.context.active_object
@@ -252,11 +317,11 @@ def setup_preview_scene():
         light.data.cycles.max_bounces = 1024
     if hasattr(light.data, "cycles") and hasattr(light.data.cycles, "use_shadow_caustics"):
         light.data.cycles.use_shadow_caustics = False
-    
+
     # Set render settings
     scene = bpy.context.scene
     scene.render.engine = 'BLENDER_EEVEE_NEXT' # Use EEVEE for speed, fallback to CYCLES if needed
-    
+
     # Try setting GPU device if using Cycles (though Eevee is preferred for speed)
     if scene.render.engine == 'CYCLES':
         scene.cycles.samples = 16 # Reduce samples further
@@ -268,10 +333,10 @@ def setup_preview_scene():
         cycles_preferences.get_devices()
         for device in cycles_preferences.devices:
             device.use = True
-    
+
     scene.render.resolution_x = 512
     scene.render.resolution_y = 512
-    
+
     return obj
 
 def render_preview(obj, material, temp_path):
@@ -283,7 +348,7 @@ def render_preview(obj, material, temp_path):
         obj.data.materials[0] = material
     else:
         obj.data.materials.append(material)
-    
+
     # Render
     bpy.context.scene.render.filepath = temp_path
     bpy.ops.render.render(write_still=True)
@@ -316,7 +381,7 @@ Example:
   "tags": ["cat:metal", "style:brushed", "state:scratched", "feel:silver", "use:reflective", "use:industrial"]
 }
 """
-    
+
     user_content = [
         {"type": "text", "text": f"Generate visual tags for this material: {material_name}."},
         {"type": "image_url", "image_url": {"url": image_data_url}},
@@ -377,9 +442,9 @@ def main():
         skip_existing = False if args.preview_only else SKIP_EXISTING
 
     # Blender Configuration for Auto-Launch
-    BLENDER_EXE = r"D:\software\Blender\Blender4.4\blender.exe"
-    BLEND_FILE = r"D:\Asset\Blender\MyMatLib\MyMaterials.blend"
-    
+    BLENDER_EXE = os.environ.get("BLENDER_EXE") or shutil.which("blender") or ""
+    BLEND_FILE = os.environ.get("MATCOMPOSER_BLEND_FILE", "")
+
     # Check if we are in a functional Blender environment
     valid_bpy = False
     try:
@@ -394,16 +459,16 @@ def main():
     if not valid_bpy:
         print("Blender environment not detected (or dummy bpy found). Launching Blender background process...")
         import subprocess
-        
+
         if not os.path.exists(BLENDER_EXE):
-            print(f"Error: Blender executable not found at {BLENDER_EXE}")
+            print("Set BLENDER_EXE or add Blender to PATH; alternatively run with blender --background <file.blend> --python this_script.py.")
             return
         if not os.path.exists(BLEND_FILE):
-            print(f"Error: Blend file not found at {BLEND_FILE}")
+            print("Set MATCOMPOSER_BLEND_FILE to an existing .blend file, or run this script directly with Blender.")
             return
-            
+
         # Add --background to run headless
-        cmd = [BLENDER_EXE, BLEND_FILE, "--background", "--factory-startup", "-P", __file__]
+        cmd = [BLENDER_EXE, "--background", "--factory-startup", BLEND_FILE, "-P", __file__]
         script_argv = _extract_script_argv(sys.argv)
         if script_argv:
             cmd += ["--"] + script_argv
@@ -420,25 +485,26 @@ def main():
 
     print("Setting up preview scene...")
     preview_obj = setup_preview_scene()
-    
+
     # Load Catalog Map
     catalog_map = load_catalog_map()
-    
+
     temp_dir = tempfile.gettempdir()
     temp_img = os.path.join(temp_dir, "mat_preview_temp.png")
 
-    blend_name = os.path.splitext(os.path.basename(bpy.data.filepath or "untitled"))[0]
-    previews_dir = os.path.join(cache_dir, "previews", blend_name)
+    preview_subdir = str(args.preview_subdir or "MyMaterials").strip().strip("/\\") or "MyMaterials"
+    previews_dir = os.path.join(cache_dir, "previews", preview_subdir)
     if args.preview_only:
         os.makedirs(previews_dir, exist_ok=True)
-    
+
     materials = [m for m in bpy.data.materials if m.use_nodes] # Only node materials
     total = len(materials)
-    
+
     print(f"Found {total} materials in file. Scanning for processing candidates...")
 
     materials_to_process = []
     skipped_tagged = 0
+    skipped_preview = 0
     skipped_other = 0
 
     for mat in materials:
@@ -452,44 +518,52 @@ def main():
             if not mat.asset_data:
                 skipped_other += 1
                 continue
-            cat_id = mat.asset_data.catalog_id
+            cat_id = _normalize_catalog_uuid(mat.asset_data.catalog_id)
             cat_path = catalog_map.get(cat_id, "")
             # Check if path matches or is subdirectory
             # Normalize for comparison: strip slashes, lowercase
             cat_path_norm = cat_path.strip().strip("/").lower()
             target_norm = target_catalog.strip().strip("/").lower()
-            
-            if cat_path_norm != target_norm and not cat_path_norm.startswith(target_norm + "/"):
+
+            if not _catalog_matches(target_norm, cat_path_norm):
                 skipped_other += 1
                 continue
 
         # Check existing tags
-        if skip_existing and mat.asset_data and mat.asset_data.tags:
+        if skip_existing and _has_asset_tags(getattr(mat, "asset_data", None)):
             skipped_tagged += 1
             continue
-        
+
+        if args.preview_only and args.skip_existing_preview:
+            out_path = _preview_output_path(previews_dir, mat.name)
+            if os.path.exists(out_path):
+                skipped_preview += 1
+                continue
+
         materials_to_process.append(mat)
 
     print("-" * 40)
     print(f"Total Materials Found: {total}")
     print(f"Skipped (Already Tagged): {skipped_tagged}")
+    if args.preview_only and args.skip_existing_preview:
+        print(f"Skipped (Existing Preview): {skipped_preview}")
     if skipped_other > 0:
         print(f"Skipped (Name/Catalog Filter): {skipped_other}")
     print(f"Queue to Process: {len(materials_to_process)}")
     print("-" * 40)
-    
+
     count = 0
     total_process = len(materials_to_process)
-    
+
     for i, mat in enumerate(materials_to_process):
         print(f"[{i+1}/{total_process}] Processing: {mat.name}...")
 
         if (not args.preview_only) and (not mat.asset_data):
             mat.asset_mark()
-            
+
         # Render
         if args.preview_only:
-            out_path = os.path.join(previews_dir, _safe_filename(mat.name) + ".png")
+            out_path = _preview_output_path(previews_dir, mat.name)
             render_preview(preview_obj, mat, out_path)
             if not os.path.exists(out_path):
                 print("  Render failed.")
@@ -502,16 +576,18 @@ def main():
         if not os.path.exists(temp_img):
             print("  Render failed.")
             continue
-            
+
         # Call AI
         img_url = encode_image(temp_img)
         tags = get_tags_from_vlm(img_url, mat.name)
-        
+
         if tags:
             print(f"  Generated Tags: {tags}")
             # Clear existing if needed? Or just append? Logic here assumes we append or set fresh if empty
             # If SKIP_EXISTING is True, we only get here if empty.
-            
+            if not mat.asset_data:
+                mat.asset_mark()
+
             for tag in tags:
                 norm = normalize_tag_prefix(tag)
                 if not norm:
@@ -524,7 +600,7 @@ def main():
                 if not exists:
                     mat.asset_data.tags.new(norm)
             count += 1
-            
+
             # Save progress every 5 materials or if it's the target material
             if count % 5 == 0 or target_material:
                 print(f"  Saving progress (Processed {count})...")
@@ -533,7 +609,7 @@ def main():
             print("  No tags generated.")
 
     print(f"Done. Processed {count} materials.")
-    
+
     # Save the file
     if not args.preview_only:
         print("Saving file...")

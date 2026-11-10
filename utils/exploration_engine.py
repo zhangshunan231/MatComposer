@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (C) 2026 MatComposer authors
+
 import math
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -50,7 +53,9 @@ def _entry_text(entry: Dict[str, Any]) -> str:
             return ""
         w = 1
         if prefix in ("cat", "category", "type", "substrate"):
-            w = 4
+            # Category/substrate should dominate retrieval because it defines
+            # the material family more strongly than state/style modifiers.
+            w = 8
         elif prefix in ("state", "surface"):
             w = 3
         elif prefix in ("style", "look"):
@@ -198,8 +203,8 @@ def pick_top_n_ids(candidates: List[ExplorationCandidate], n: int = 4) -> List[s
 
 
 def calculate_structural_penalty(
-    entry_k_vec: List[float], 
-    target_k_vec: List[float], 
+    entry_k_vec: List[float],
+    target_k_vec: List[float],
     weights: Optional[List[float]] = None
 ) -> float:
     """
@@ -208,18 +213,18 @@ def calculate_structural_penalty(
     """
     if not entry_k_vec or not target_k_vec:
         return 0.0
-    
+
     # Ensure lengths match (pad with 0)
     dims = max(len(entry_k_vec), len(target_k_vec))
     e_vec = list(entry_k_vec) + [0.0] * (dims - len(entry_k_vec))
     t_vec = list(target_k_vec) + [0.0] * (dims - len(target_k_vec))
-    
+
     if weights is None:
         # Default: Only consider Complexity (index 0) if weights not provided
         weights = [1.0] + [0.0] * (dims - 1)
     else:
         weights = list(weights) + [0.0] * (dims - len(weights))
-        
+
     dist_sq = 0.0
     for i in range(dims):
         w = weights[i]
@@ -227,5 +232,5 @@ def calculate_structural_penalty(
             continue
         diff = e_vec[i] - t_vec[i]
         dist_sq += w * (diff * diff)
-        
+
     return math.sqrt(dist_sq)

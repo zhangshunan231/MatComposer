@@ -1,7 +1,10 @@
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (C) 2026 MatComposer authors
+
 bl_info = {
     "name": "MatComposer",
-    "author": "Trae",
-    "version": (1, 0),
+    "author": "MatComposer authors",
+    "version": (1, 0, 0),
     "blender": (4, 0, 0),
     "location": "Shader Editor > UI > MatComposer",
     "description": "Neuro-Symbolic procedural material generation",
@@ -14,6 +17,25 @@ from . import operators
 
 # Scene Properties
 import json
+import os
+
+_session_api_key = os.environ.get("DASHSCOPE_API_KEY", "")
+
+
+def _get_api_key(_self):
+    return _session_api_key
+
+
+def _set_api_key(_self, value):
+    global _session_api_key
+    _session_api_key = str(value)
+
+
+def _clear_legacy_api_keys():
+    for scene in bpy.data.scenes:
+        props = getattr(scene, "mat_composer", None)
+        if props is not None and "api_key" in props:
+            del props["api_key"]
 
 def _safe_load_json_dict(s):
     if not s:
@@ -59,18 +81,9 @@ def _candidate_items(self, role):
 
     # Determine visibility
     show_all = True
-    
+
     # Determine current selection index to ensure it's always visible
-    curr_val = "0"
-    try:
-        data = _safe_load_json_dict(getattr(props, "slot_selection_json", ""))
-        slot_data = data.get(str(role))
-        if isinstance(slot_data, dict):
-            curr_id = str(slot_data.get("curr") or "")
-            if curr_id and curr_id in ids:
-                curr_val = str(ids.index(curr_id) + 1)
-    except:
-        pass
+    curr_val = _selection_enum_value_for_role(props, role, ids)
 
     # Helper for description (tooltip)
     def get_desc(entry):
@@ -104,10 +117,11 @@ def _candidate_items(self, role):
         return " | ".join(lines) if lines else ""
 
     out = []
-    
+    out.append(("0", "None", "No material", 'X', 0))
+
     for i in range(1, 5):
         key = str(i)
-        
+
         # Visibility Logic
         is_visible = show_all
         if not is_visible:
@@ -115,7 +129,7 @@ def _candidate_items(self, role):
                 is_visible = True
             elif curr_val == "0" and i == 1:
                 is_visible = True
-        
+
         if not is_visible:
             continue
 
@@ -125,7 +139,7 @@ def _candidate_items(self, role):
             entry = lm.get_entry_by_id(eid)
             name = str(entry.get("name") or eid) if isinstance(entry, dict) else str(eid)
             desc = get_desc(entry)
-            
+
             icon_id = 0
             if isinstance(entry, dict):
                 try:
@@ -143,8 +157,22 @@ def _candidate_items(self, role):
         else:
             # Placeholder for empty slot
             out.append((key, f"Empty {i}", "No material", 'NONE', i))
-            
+
     return out
+
+
+def _selection_enum_value_for_role(props, role, ids):
+    curr_val = "0"
+    try:
+        data = _safe_load_json_dict(getattr(props, "slot_selection_json", ""))
+        slot_data = data.get(str(role))
+        if isinstance(slot_data, dict):
+            curr_id = str(slot_data.get("curr") or "")
+            if curr_id and curr_id in ids:
+                curr_val = str(ids.index(curr_id) + 1)
+    except Exception:
+        pass
+    return curr_val
 
 
 def _candidate_items_base(self, context):
@@ -164,7 +192,7 @@ def _candidate_update(self, context, role, prop_name):
         val_str = str(getattr(self, prop_name) or "0")
     except Exception:
         val_str = "0"
-    
+
     if val_str == "0":
         return
 
@@ -183,11 +211,12 @@ def _candidate_update(self, context, role, prop_name):
             # Check for duplicates across slots
             data = _safe_load_json_dict(getattr(self, "slot_selection_json", ""))
             all_roles = ["Base", "Overlay", "Detail"]
-            
+            restore_val = _selection_enum_value_for_role(self, role, ids)
+
             for other_role in all_roles:
                 if other_role == role:
                     continue
-                
+
                 other_data = data.get(other_role)
                 if isinstance(other_data, dict):
                     other_id = str(other_data.get("curr") or "")
@@ -195,11 +224,14 @@ def _candidate_update(self, context, role, prop_name):
                         # Found duplicate
                         def draw_warning(self, context):
                             self.layout.label(text=f"Material already selected in {other_role}!")
-                        
+
                         bpy.context.window_manager.popup_menu(draw_warning, title="Duplicate Selection", icon='ERROR')
-                        
-                        # Reset selection to None ("0")
-                        setattr(self, prop_name, "0")
+
+                        # Keep previous valid selection for this slot.
+                        try:
+                            setattr(self, prop_name, restore_val)
+                        except Exception:
+                            pass
                         return
 
             _set_selection_for_role(self, role, real_id)
@@ -225,14 +257,16 @@ class MatComposerProperties(bpy.types.PropertyGroup):
     api_key: bpy.props.StringProperty(
         name="API Key",
         description="DashScope API Key",
-        default="",
-        subtype='PASSWORD'
+        get=_get_api_key,
+        set=_set_api_key,
+        subtype='PASSWORD',
+        options={'SKIP_SAVE'},
     )
     text_prompt: bpy.props.StringProperty(
         name="Text Prompt",
         description="Describe the material you want",
         default="",
-        options={'SKIP_SAVE'} 
+        options={'SKIP_SAVE'}
     )
     image_input: bpy.props.PointerProperty(
         name="Image",
@@ -268,11 +302,11 @@ class MatComposerProperties(bpy.types.PropertyGroup):
         description="Print debug info to system console",
         default=False
     )
-    
+
     # State Management
     history: bpy.props.CollectionProperty(type=MatComposerHistoryItem)
     current_history_index: bpy.props.IntProperty(default=-1)
-    
+
     # Variants (we store 4 slots)
     variant_1_params: bpy.props.StringProperty(default="")
     variant_2_params: bpy.props.StringProperty(default="")
@@ -310,6 +344,7 @@ class MatComposerProperties(bpy.types.PropertyGroup):
 
     slot_candidates_json: bpy.props.StringProperty(default="", options={'SKIP_SAVE'})
     slot_selection_json: bpy.props.StringProperty(default="", options={'SKIP_SAVE'})
+    mask_selection_json: bpy.props.StringProperty(default="", options={'SKIP_SAVE'})
     last_search_state_json: bpy.props.StringProperty(default="", options={'SKIP_SAVE'})
 
     candidate_pick_base: bpy.props.EnumProperty(items=_candidate_items_base, update=_candidate_update_base, options={'SKIP_SAVE'})
@@ -350,7 +385,7 @@ class MatComposerProperties(bpy.types.PropertyGroup):
 
     prev_selected_entry_id: bpy.props.StringProperty(default="", options={'SKIP_SAVE'})
     curr_selected_entry_id: bpy.props.StringProperty(default="", options={'SKIP_SAVE'})
-    
+
     last_exploration_mode: bpy.props.StringProperty(
         name="Last Exploration Mode",
         default="LOCAL",
@@ -375,15 +410,18 @@ def _reset_candidate_picks_for_scene(scene):
     except Exception:
         pass
 
+@bpy.app.handlers.persistent
 def _on_load_post(_dummy):
+    _clear_legacy_api_keys()
     for scene in getattr(bpy.data, "scenes", []) or []:
         _reset_candidate_picks_for_scene(scene)
 
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
-    
+
     bpy.types.Scene.mat_composer = bpy.props.PointerProperty(type=MatComposerProperties)
+    _clear_legacy_api_keys()
 
     for scene in getattr(bpy.data, "scenes", []) or []:
         _reset_candidate_picks_for_scene(scene)
@@ -392,7 +430,7 @@ def register():
             bpy.app.handlers.load_post.append(_on_load_post)
     except Exception:
         pass
-    
+
     ui.register()
     operators.register()
 
@@ -405,9 +443,9 @@ def unregister():
             bpy.app.handlers.load_post.remove(_on_load_post)
     except Exception:
         pass
-    
+
     del bpy.types.Scene.mat_composer
-    
+
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
 

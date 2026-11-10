@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (C) 2026 MatComposer authors
+
 import bpy
 import mathutils
 
@@ -7,20 +10,20 @@ def clean_tree(tree):
     for node in nodes:
         if node.type != 'OUTPUT_MATERIAL':
             nodes.remove(node)
-    
+
     # Ensure Material Output exists if it was missing
     output_node = None
     for node in nodes:
         if node.type == 'ShaderNodeOutputMaterial':
             output_node = node
             break
-            
+
     if not output_node:
         output_node = tree.nodes.new(type='ShaderNodeOutputMaterial')
         output_node.location = (300, 0)
         output_node.label = "Material Output"
         output_node.name = "Material Output"
-    
+
     return output_node
 
 def create_node(tree, type_name, location, label=None, name=None):
@@ -42,29 +45,29 @@ def _get_node_fuzzy(nodes, name):
     node = nodes.get(name)
     if node:
         return node
-    
+
     # Try case-insensitive match
     name_lower = name.lower()
     for n in nodes:
         if n.name.lower() == name_lower:
             return n
-            
+
     # Special handling for "Material Output" variations
     if "output" in name_lower:
         for n in nodes:
             if n.type == 'OUTPUT_MATERIAL':
                 return n
-                
+
     return None
 
 def link_nodes(tree, from_node_name, from_socket_name, to_node_name, to_socket_name):
     """Link two nodes by name and socket name."""
     nodes = tree.nodes
     links = tree.links
-    
+
     from_node = _get_node_fuzzy(nodes, from_node_name)
     to_node = _get_node_fuzzy(nodes, to_node_name)
-    
+
     if not from_node:
         print(f"Error: Could not find source node '{from_node_name}'")
         return False
@@ -75,7 +78,7 @@ def link_nodes(tree, from_node_name, from_socket_name, to_node_name, to_socket_n
     # Find sockets
     from_socket = from_node.outputs.get(from_socket_name)
     to_socket = to_node.inputs.get(to_socket_name)
-    
+
     if not from_socket:
         print(f"Error: Output socket '{from_socket_name}' not found on '{from_node_name}'")
         # Fallback: try to find by case-insensitive name
@@ -83,7 +86,7 @@ def link_nodes(tree, from_node_name, from_socket_name, to_node_name, to_socket_n
             if out.name.lower() == from_socket_name.lower():
                 from_socket = out
                 break
-    
+
     if not to_socket:
         print(f"Error: Input socket '{to_socket_name}' not found on '{to_node_name}'")
         # Fallback: try to find by case-insensitive name
@@ -91,7 +94,7 @@ def link_nodes(tree, from_node_name, from_socket_name, to_node_name, to_socket_n
              if inp.name.lower() == to_socket_name.lower():
                 to_socket = inp
                 break
-    
+
     if from_socket and to_socket:
         links.new(from_socket, to_socket)
         return True
@@ -110,13 +113,13 @@ def set_input_value(node, socket_name, value):
             # Clear existing (except first/last usually can't be deleted easily in UI but API allows?)
             # API allows removing all but one usually.
             # But let's just resize/overwrite.
-            
+
             # Ensure enough elements
             while len(elements) < len(value):
                 elements.new(1.0)
             while len(elements) > len(value):
                 elements.remove(elements[-1])
-                
+
             for i, stop_data in enumerate(value):
                 elem = elements[i]
                 elem.position = stop_data.get("position", i / max(1, len(value)-1))
@@ -130,7 +133,7 @@ def set_input_value(node, socket_name, value):
     socket_map = {
         "Principled BSDF": {
             "Subsurface": "Subsurface Weight",
-            "Subsurface IOR": "IOR", 
+            "Subsurface IOR": "IOR",
             "Specular": "Specular IOR Level",
             "Transmission": "Transmission Weight",
             "Coat": "Coat Weight",
@@ -138,7 +141,7 @@ def set_input_value(node, socket_name, value):
             "Emission": "Emission Color",
         }
     }
-    
+
     candidates = [socket_name]
     if node.name == "Principled BSDF" or node.type == "ShaderNodeBsdfPrincipled":
         mapping = socket_map.get("Principled BSDF")
@@ -152,7 +155,7 @@ def set_input_value(node, socket_name, value):
         socket = node.inputs.get(name)
         if socket:
             break
-    
+
     # Fallback: fuzzy search
     if not socket:
         target_lower = socket_name.lower()
@@ -172,7 +175,7 @@ def set_input_value(node, socket_name, value):
     if not socket:
         print(f"Error: Socket '{socket_name}' not found on '{node.name}' (Tried: {candidates})")
         return
-        
+
     try:
         if isinstance(value, (int, float)):
             socket.default_value = value
@@ -196,23 +199,23 @@ def get_node_parameters(tree):
     params = {}
     if not tree:
         return params
-        
+
     for node in tree.nodes:
         # Skip output nodes
         if node.type == 'OUTPUT_MATERIAL':
             continue
-            
+
         for input_socket in node.inputs:
             # We only care about unconnected sockets that have values
             if not input_socket.is_linked:
                 # Store if it's a value we can manipulate (Float, Vector, Color)
                 val = None
                 try:
-                    # Access default_value directly. 
-                    # Note: Some sockets (like Shader) don't have a simple default_value we can tween easily 
+                    # Access default_value directly.
+                    # Note: Some sockets (like Shader) don't have a simple default_value we can tween easily
                     # without checking type, but for PBR parameters it works.
                     val = input_socket.default_value
-                    
+
                     # Convert Blender types to Python types for JSON/Math
                     if hasattr(val, 'to_tuple'): # Color/Vector
                         val = list(val)
@@ -220,7 +223,7 @@ def get_node_parameters(tree):
                         pass
                     else:
                         continue # Skip types we don't handle
-                        
+
                     key = f"{node.name}.{input_socket.name}"
                     params[key] = val
                 except:
@@ -233,7 +236,7 @@ def apply_parameters(tree, params):
     """
     if not tree:
         return
-        
+
     for key, value in params.items():
         try:
             node_name, socket_name = key.split('.', 1)
@@ -253,48 +256,48 @@ def build_graph(tree, data):
     # Clear existing nodes (except output if we want to be safe, but clean_tree handles it)
     # Actually, let's reuse clean_tree
     clean_tree(tree)
-    
-    # But clean_tree keeps one output node. If the JSON defines its own output node, we might have duplicates 
+
+    # But clean_tree keeps one output node. If the JSON defines its own output node, we might have duplicates
     # if we are not careful. However, usually we just want to ensure one output exists.
-    # The JSON schema usually generates components. 
-    
+    # The JSON schema usually generates components.
+
     components = data.get("components", [])
     links = data.get("links", [])
-    
+
     # Pass 1: Create Nodes
     x_pos = -300
     y_pos = 0
-    
+
     for comp in components:
         node_type = comp.get("node_type")
         name = comp.get("name")
         inputs = comp.get("inputs", {})
-        
+
         # If it's the Material Output, try to find the existing one
         if node_type == 'ShaderNodeOutputMaterial':
             # We already have one from clean_tree
             continue
-            
+
         # Layout logic (very simple)
         x_pos -= 300
         if x_pos < -1200:
             x_pos = -300
             y_pos -= 300
-            
+
         # Create
         node = create_node(tree, node_type, (x_pos, y_pos), label=name, name=name)
-        
+
         if node:
             # Set inputs
             for socket_name, value in inputs.items():
                 set_input_value(node, socket_name, value)
-                
+
     # Pass 2: Links
     for link in links:
         link_nodes(
-            tree, 
-            link["from_node"], 
-            link["from_socket"], 
-            link["to_node"], 
+            tree,
+            link["from_node"],
+            link["from_socket"],
+            link["to_node"],
             link["to_socket"]
         )
