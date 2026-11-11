@@ -13,3 +13,11 @@ blender --background --factory-startup --python-exit-code 1 --python tests/blend
 ```
 
 Submit source-code contributions under GPL-3.0-only. Do not attach third-party materials without redistribution permission; identify the source and license for any proposed asset contribution.
+
+Enable this repository's credential checks after cloning:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+The pre-commit hook scans staged content, and the pre-push hook scans reachable Git history. Run them manually with `python scripts/check_secrets.py --staged` or `python scripts/check_secrets.py --all-history`. Findings report file names without revealing credential values. Pattern matching is a safeguard, not a replacement for reviewing changes and keeping secrets in environment variables.
